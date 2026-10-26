@@ -248,7 +248,10 @@ class ZeppCloudRepository(context: Context) {
             logout()
             throw ZeppException("Сессия Zepp истекла или отозвана. Войдите снова.")
         }
-        if (result.code !in 200..299) throw ZeppException("Ошибка Zepp API: HTTP ${result.code}")
+        if (result.code !in 200..299) {
+            val detail = result.body.replace(Regex("\\s+"), " ").take(160)
+            throw ZeppException("Ошибка Zepp API: HTTP ${result.code}${if (detail.isNotBlank()) " — $detail" else ""}")
+        }
         return result.body
     }
 
@@ -260,22 +263,52 @@ class ZeppCloudRepository(context: Context) {
     }.getOrNull()
 
     private fun extractItems(rootText: String): List<JSONObject> {
-        val root = JSONObject(rootText)
-        var data: Any? = root.opt("data") ?: root
-        if (data is String) data = decodeJsonOrBase64(data)
-        if (data is JSONObject) {
-            val summary = data.opt("summary")
-            if (summary is String) data = decodeJsonOrBase64(summary)
-            else if (summary is JSONArray) return jsonObjects(summary)
+        // Some Zepp endpoints return JSON nested inside a JSON string, while error
+        // responses may be plain text. Unwrap safely instead of calling getJSONObject
+        // on a field whose type is actually String.
+        fun parse(value: String): Any? {
+            val trimmed = value.trim()
+            if (trimmed.isEmpty()) return null
+            runCatching { return JSONObject(trimmed) }
+            runCatching { return JSONArray(trimmed) }
+            val decoded = decodeJsonOrBase64(trimmed)
+            if (decoded != null) return decoded
+            return null
         }
-        if (data is JSONObject) {
-            val arr = data.optJSONArray("items") ?: data.optJSONArray("data")
-            if (arr != null) return jsonObjects(arr)
-            val summary = data.optJSONObject("summary")?.optJSONArray("data")
-            if (summary != null) return jsonObjects(summary)
+        var root: Any? = parse(rootText)
+        repeat(3) {
+            if (root is String) root = parse(root)
         }
-        if (data is JSONArray) return jsonObjects(data)
-        return emptyList()
+        if (root !is JSONObject && root !is JSONArray) {
+            val preview = rootText.trim().replace(Regex("\\s+"), " ").take(180)
+            throw ZeppException("Ответ Zepp не является JSON-объектом или массивом: $preview")
+        }
+        var data: Any? = if (root is JSONObject) (root as JSONObject).opt("data") ?: root else root
+        repeat(3) {
+            if (data is String) data = parse(data as String)
+            if (data is JSONObject) {
+                val obj = data as JSONObject
+                val summary = obj.opt("summary")
+                if (summary is String || summary is JSONArray || summary is JSONObject) data = summary
+                else {
+                    val items = obj.opt("items")
+                    val nested = obj.opt("data")
+                    if (items is JSONArray) data = items
+                    else if (nested is JSONArray || nested is JSONObject || nested is String) data = nested
+                }
+            }
+        }
+        return when (data) {
+            is JSONArray -> jsonObjects(data as JSONArray)
+            is JSONObject -> {
+                val obj = data as JSONObject
+                val arr = obj.opt("items") as? JSONArray
+                    ?: obj.opt("data") as? JSONArray
+                    ?: (obj.opt("summary") as? JSONObject)?.opt("data") as? JSONArray
+                arr?.let(::jsonObjects) ?: emptyList()
+            }
+            else -> emptyList()
+        }
     }
 
     private fun jsonObjects(arr: JSONArray): List<JSONObject> = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
