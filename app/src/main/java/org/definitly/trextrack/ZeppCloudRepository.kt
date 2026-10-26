@@ -3,9 +3,9 @@ package org.definitly.trextrack
 /**
  * Cloud integration boundary.
  *
- * This interface intentionally contains no guessed endpoints or fake activity data.
- * Implement only after validating a lawful, working authentication flow and the
- * route/workout response schema against a test account.
+ * Authentication is implemented via [ZeppCloudRepositoryImpl] (direct login +
+ * Android Keystore session). Workout/track endpoints stay unimplemented until
+ * the route response schema is verified against a test account.
  */
 interface ZeppCloudRepository {
     suspend fun authenticate(account: String, credential: CharArray): AuthResult

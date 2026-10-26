@@ -2,15 +2,23 @@
 
 Android/Kotlin starter project for a standalone GPX exporter targeting Amazfit T-Rex 2 users.
 
-## Important status
+## Status
 
-This is a **starter source project**, not yet a complete Zepp-cloud client. The app does not use or launch the Zepp app, and does not pretend to authenticate or return fabricated workouts. The current UI supports selecting a local GPX and saving a copy. Cloud account access is represented by `ZeppCloudRepository.kt` and must be implemented after the account authentication and route API are verified.
+- **Direct Zepp login** (email/password, no Zepp app) is implemented in `ZeppAuthClient`.
+- **Session** (`app_token`, `user_id`, optional `login_token`, region host) is stored in
+  `EncryptedSharedPreferences` backed by **Android Keystore**. Password is never persisted.
+- Workout history and GPS download are still stubs — implement after verifying route APIs
+  against a real account.
+- Local GPX open/save still works for file-flow testing.
 
-## Why cloud access is not filled with guessed endpoints
+## Auth notes
 
-- Zepp's official third-party platform requires partner onboarding, an approved app, and approved permissions.
-- A community exporter exists for the reverse-engineered Huami/Zepp API, but its documented token setup extracts a token from the Zepp Android app. That route conflicts with the requirement not to use Zepp at all.
-- Therefore the next technical task is to validate a direct account-authentication path that does not require the Zepp app, then implement the actual workout-list and GPS-track endpoints. Do not enter your account password into this scaffold.
+- Official Zepp Open Platform requires partner onboarding.
+- This app uses the reverse-engineered account endpoints (same family as community tools).
+- Use an **email + password** Zepp account (not Apple/Google-only social login).
+- If `/v2/registrations/tokens` returns HTTP 400, the region may require an encrypted body;
+  extend `ZeppAuthClient` with the current AES scheme from maintained community clients.
+- Never log credentials or tokens.
 
 ## Build
 
@@ -21,7 +29,7 @@ Requirements: JDK 17, Android SDK platform 35, Android Gradle Plugin 8.7.3.
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-If the project is built on FreeBSD and Gradle/AGP rejects the host OS, use the same local workaround that may be needed in your environment:
+If the project is built on FreeBSD and Gradle/AGP rejects the host OS:
 
 ```sh
 JAVA_TOOL_OPTIONS=-Dos.name=Linux ./gradlew assembleDebug
@@ -29,8 +37,8 @@ JAVA_TOOL_OPTIONS=-Dos.name=Linux ./gradlew assembleDebug
 
 ## Planned implementation
 
-1. Validate direct Zepp account login without the Zepp app.
-2. Store refresh/session tokens in Android Keystore-backed storage; never log credentials.
+1. ~~Validate direct Zepp account login without the Zepp app.~~
+2. ~~Store refresh/session tokens in Android Keystore-backed storage; never log credentials.~~
 3. Implement paginated workout history.
 4. Download GPS route points and map them to GPX 1.1 (`trk`, `trkseg`, `trkpt`, optional `ele` and `time`).
 5. Add date filters, bulk export, duplicate detection and error/retry handling.

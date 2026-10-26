@@ -18,21 +18,25 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file(
-                providers.gradleProperty("TREXTRACK_STORE_FILE").get()
-            )
-            storePassword =
-                providers.gradleProperty("TREXTRACK_STORE_PASSWORD").get()
-            keyAlias =
-                providers.gradleProperty("TREXTRACK_KEY_ALIAS").get()
-            keyPassword =
-                providers.gradleProperty("TREXTRACK_KEY_PASSWORD").get()
+            val store = providers.gradleProperty("TREXTRACK_STORE_FILE")
+            val storePass = providers.gradleProperty("TREXTRACK_STORE_PASSWORD")
+            val alias = providers.gradleProperty("TREXTRACK_KEY_ALIAS")
+            val keyPass = providers.gradleProperty("TREXTRACK_KEY_PASSWORD")
+            if (store.isPresent && storePass.isPresent && alias.isPresent && keyPass.isPresent) {
+                storeFile = file(store.get())
+                storePassword = storePass.get()
+                keyAlias = alias.get()
+                keyPassword = keyPass.get()
+            }
         }
     }
 
     buildTypes {
         getByName("release") {
-            signingConfig = signingConfigs.getByName("release")
+            val releaseSigning = signingConfigs.getByName("release")
+            if (releaseSigning.storeFile != null) {
+                signingConfig = releaseSigning
+            }
         }
     }
 
@@ -44,5 +48,16 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
 }
 
+dependencies {
+    implementation("androidx.security:security-crypto:1.0.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+}
