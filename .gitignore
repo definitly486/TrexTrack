@@ -4,3 +4,8 @@ local.properties
 build/
 app/build/
 *.iml
+
+# Never commit Android signing keys or local signing properties.
+*.jks
+*.keystore
+keystore.properties
