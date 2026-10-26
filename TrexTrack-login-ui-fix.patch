@@ -1,0 +1,83 @@
+diff --git a/app/src/main/java/org/definitly/trextrack/MainActivity.kt b/app/src/main/java/org/definitly/trextrack/MainActivity.kt
+index cf1454a..c9a8efb 100644
+--- a/app/src/main/java/org/definitly/trextrack/MainActivity.kt
++++ b/app/src/main/java/org/definitly/trextrack/MainActivity.kt
+@@ -202,9 +202,14 @@ class MainActivity : Activity() {
+     private fun doLogin(account: String, password: CharArray) {
+         status.text = "Авторизация…"
+         connectButton.isEnabled = false
++        logoutButton.isEnabled = false
+         scope.launch {
+-            val result = withContext(Dispatchers.IO) {
+-                repository.authenticate(account, password)
++            val result = try {
++                withContext(Dispatchers.IO) {
++                    repository.authenticate(account, password)
++                }
++            } catch (t: Throwable) {
++                AuthResult.Failure(t.message ?: t.javaClass.simpleName)
+             }
+             when (result) {
+                 is AuthResult.Success -> {
+diff --git a/app/src/main/java/org/definitly/trextrack/ZeppAuthClient.kt b/app/src/main/java/org/definitly/trextrack/ZeppAuthClient.kt
+index 792f653..1c28de2 100644
+--- a/app/src/main/java/org/definitly/trextrack/ZeppAuthClient.kt
++++ b/app/src/main/java/org/definitly/trextrack/ZeppAuthClient.kt
+@@ -33,8 +33,20 @@ class ZeppAuthClient(
+     )
+ 
+     fun login(emailOrPhone: String, password: CharArray): Session {
+-        val accessToken = requestAccessToken(emailOrPhone, password)
+-        return exchangeForAppToken(accessToken)
++        try {
++            val accessToken = requestAccessToken(emailOrPhone, password)
++            return exchangeForAppToken(accessToken)
++        } catch (e: AuthException) {
++            throw e
++        } catch (e: java.net.SocketTimeoutException) {
++            throw AuthException("Таймаут сети. Проверьте интернет и VPN.")
++        } catch (e: java.net.UnknownHostException) {
++            throw AuthException("Нет DNS/интернета: ${e.message}")
++        } catch (e: javax.net.ssl.SSLException) {
++            throw AuthException("SSL ошибка: ${e.message}")
++        } catch (e: java.io.IOException) {
++            throw AuthException("Сеть: ${e.message ?: e.javaClass.simpleName}")
++        }
+     }
+ 
+     private fun requestAccessToken(emailOrPhone: String, password: CharArray): String {
+@@ -70,17 +82,17 @@ class ZeppAuthClient(
+ 
+         http.newCall(request).execute().use { response ->
+             if (response.code != 303) {
+-                val bodySnippet = response.body?.string()?.take(200) ?: ""
++                val bodySnippet = response.body?.string()?.take(120) ?: ""
+                 throw AuthException(
+-                    "Нет Location при логине (HTTP ${response.code})" +
+-                        if (bodySnippet.isNotBlank()) ": $bodySnippet" else ""
++                    "Логин: HTTP ${response.code} (ожидали 303)" +
++                        if (bodySnippet.isNotBlank()) " · $bodySnippet" else ""
+                 )
+             }
+             val location = response.header("Location")
+-                ?: throw AuthException("Нет Location при логине (HTTP ${response.code})")
++                ?: throw AuthException("Логин: нет заголовка Location (HTTP ${response.code})")
+             val uri = Uri.parse(location)
+             val access = uri.getQueryParameter("access")
+-                ?: throw AuthException("В redirect нет access token")
++                ?: throw AuthException("Логин: в Location нет access token")
+             return access
+         }
+     }
+@@ -167,8 +179,9 @@ class ZeppAuthClient(
+             OkHttpClient.Builder()
+                 .followRedirects(false)
+                 .followSslRedirects(false)
+-                .connectTimeout(30, TimeUnit.SECONDS)
+-                .readTimeout(30, TimeUnit.SECONDS)
++                .connectTimeout(20, TimeUnit.SECONDS)
++                .readTimeout(20, TimeUnit.SECONDS)
++                .callTimeout(45, TimeUnit.SECONDS)
+                 .build()
+     }
+ }
