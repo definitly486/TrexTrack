@@ -100,16 +100,16 @@ class ZeppAuthClient(
     private fun exchangeForAppToken(accessCode: String): Session {
         val body = FormBody.Builder()
             .add("code", accessCode)
-            .add("device_id", UUID.randomUUID().toString())
+            .add("device_id", UUID.randomUUID().toString().replace("-", ""))
             .add("device_model", "android_phone")
             .add("app_version", "9.12.5")
             .add(
                 "dn",
-                "api-mifit.zepp.com,api-user.zepp.com,api-mifit.zepp.com," +
+                "api-mifit.zepp.com,api-user.zepp.com,api-mifit-us2.zepp.com," +
                     "api-watch.zepp.com,app-analytics.zepp.com,auth.zepp.com,api-analytics.zepp.com"
             )
             .add("third_name", "huami")
-            .add("source", "com.huami.watch.hmwatchmanager:9.12.5:151689")
+            .add("source", "com.huami.midong")
             .add("app_name", APP_NAME)
             .add("country_code", "US")
             .add("grant_type", "access_token")
@@ -121,17 +121,13 @@ class ZeppAuthClient(
         val request = Request.Builder()
             .url(LOGIN_URL)
             .post(body)
-            .header("app_name", "com.huami.webapp")
-            .header("appname", "com.huami.webapp")
-            .header("origin", "https://user.zepp.com")
-            .header("referer", "https://user.zepp.com/")
-            .header(
-                "user-agent",
-                "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
-            )
+            // Must match APP_NAME used for sport history (mobile Zepp, not web)
+            .header("app_name", APP_NAME)
+            .header("appname", APP_NAME)
+            .header("appPlatform", "android_phone")
             .header("content-type", "application/x-www-form-urlencoded; charset=UTF-8")
-            .header("accept", "application/json, text/plain, */*")
-            .header("accept-language", "en-US,en;q=0.5")
+            .header("accept", "application/json")
+            .header("User-Agent", "Zepp/9.12.5 (Android 12; Pixel 4)")
             .build()
 
         http.newCall(request).execute().use { response ->

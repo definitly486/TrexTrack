@@ -1,0 +1,172 @@
+diff --git a/app/src/main/java/org/definitly/trextrack/ZeppAuthClient.kt b/app/src/main/java/org/definitly/trextrack/ZeppAuthClient.kt
+index 1c28de2..f0a07da 100644
+--- a/app/src/main/java/org/definitly/trextrack/ZeppAuthClient.kt
++++ b/app/src/main/java/org/definitly/trextrack/ZeppAuthClient.kt
+@@ -100,16 +100,16 @@ class ZeppAuthClient(
+     private fun exchangeForAppToken(accessCode: String): Session {
+         val body = FormBody.Builder()
+             .add("code", accessCode)
+-            .add("device_id", UUID.randomUUID().toString())
++            .add("device_id", UUID.randomUUID().toString().replace("-", ""))
+             .add("device_model", "android_phone")
+             .add("app_version", "9.12.5")
+             .add(
+                 "dn",
+-                "api-mifit.zepp.com,api-user.zepp.com,api-mifit.zepp.com," +
++                "api-mifit.zepp.com,api-user.zepp.com,api-mifit-us2.zepp.com," +
+                     "api-watch.zepp.com,app-analytics.zepp.com,auth.zepp.com,api-analytics.zepp.com"
+             )
+             .add("third_name", "huami")
+-            .add("source", "com.huami.watch.hmwatchmanager:9.12.5:151689")
++            .add("source", "com.huami.midong")
+             .add("app_name", APP_NAME)
+             .add("country_code", "US")
+             .add("grant_type", "access_token")
+@@ -121,17 +121,13 @@ class ZeppAuthClient(
+         val request = Request.Builder()
+             .url(LOGIN_URL)
+             .post(body)
+-            .header("app_name", "com.huami.webapp")
+-            .header("appname", "com.huami.webapp")
+-            .header("origin", "https://user.zepp.com")
+-            .header("referer", "https://user.zepp.com/")
+-            .header(
+-                "user-agent",
+-                "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
+-            )
++            // Must match APP_NAME used for sport history (mobile Zepp, not web)
++            .header("app_name", APP_NAME)
++            .header("appname", APP_NAME)
++            .header("appPlatform", "android_phone")
+             .header("content-type", "application/x-www-form-urlencoded; charset=UTF-8")
+-            .header("accept", "application/json, text/plain, */*")
+-            .header("accept-language", "en-US,en;q=0.5")
++            .header("accept", "application/json")
++            .header("User-Agent", "Zepp/9.12.5 (Android 12; Pixel 4)")
+             .build()
+ 
+         http.newCall(request).execute().use { response ->
+diff --git a/app/src/main/java/org/definitly/trextrack/ZeppCloudRepositoryImpl.kt b/app/src/main/java/org/definitly/trextrack/ZeppCloudRepositoryImpl.kt
+index 2f4e595..e6f94ff 100644
+--- a/app/src/main/java/org/definitly/trextrack/ZeppCloudRepositoryImpl.kt
++++ b/app/src/main/java/org/definitly/trextrack/ZeppCloudRepositoryImpl.kt
+@@ -48,13 +48,14 @@ class ZeppCloudRepositoryImpl(
+         var pages = 0
+         do {
+             pages++
+-            val urlBuilder = "$DATA_HOST/v1/sport/run/history.json".toHttpUrl().newBuilder()
++            val urlBuilder = "https://placeholder/v1/sport/run/history.json".toHttpUrl().newBuilder()
+                 .addQueryParameter("userid", userId)
+                 .addQueryParameter("limit", "50")
+             if (nextTrackId != null) {
+                 urlBuilder.addQueryParameter("trackid", nextTrackId.toString())
+             }
+-            val body = getJson(urlBuilder.build().toString(), token)
++            val path = urlBuilder.build().encodedPath + "?" + (urlBuilder.build().encodedQuery ?: "")
++            val body = getJson(path, token)
+             val data = body.optJSONObject("data") ?: body
+             val summary = data.optJSONArray("summary") ?: JSONArray()
+             for (i in 0 until summary.length()) {
+@@ -90,13 +91,14 @@ class ZeppCloudRepositoryImpl(
+         val userId = sessionStore.getUserId()
+         val source = sourceByTrackId[workoutId] ?: "run.mi.com"
+ 
+-        val urlBuilder = "$DATA_HOST/v1/sport/run/detail.json".toHttpUrl().newBuilder()
++        val urlBuilder = "https://placeholder/v1/sport/run/detail.json".toHttpUrl().newBuilder()
+             .addQueryParameter("trackid", workoutId)
+             .addQueryParameter("source", source)
+         if (!userId.isNullOrBlank()) {
+             urlBuilder.addQueryParameter("userid", userId)
+         }
+-        val body = getJson(urlBuilder.build().toString(), token)
++        val path = urlBuilder.build().encodedPath + "?" + (urlBuilder.build().encodedQuery ?: "")
++        val body = getJson(path, token)
+         val data = body.optJSONObject("data") ?: body
+ 
+         val start = workoutId.toLongOrNull()
+@@ -122,23 +124,60 @@ class ZeppCloudRepositoryImpl(
+         sourceByTrackId.clear()
+     }
+ 
+-    private fun getJson(url: String, appToken: String): JSONObject {
+-        val request = Request.Builder()
+-            .url(url)
+-            .get()
+-            .header("apptoken", appToken)
+-            .header("appname", "com.huami.midong")
+-            .header("appPlatform", "android_phone")
+-            .header("User-Agent", "Zepp/9.12.5 (Pixel 4; Android 12; Density/2.75)")
+-            .header("Accept", "application/json")
+-            .build()
+-        http.newCall(request).execute().use { response ->
+-            val text = response.body?.string().orEmpty()
+-            if (!response.isSuccessful) {
+-                throw IllegalStateException("HTTP ${response.code}: ${text.take(200)}")
++    private fun getJson(pathAndQuery: String, appToken: String): JSONObject {
++        // pathAndQuery like "/v1/sport/run/history.json?userid=..."
++        val appNames = listOf(
++            "com.huami.midong",
++            "com.xiaomi.hm.health",
++            "com.huami.watch",
++            "com.huami.webapp"
++        )
++        val hosts = listOf(
++            "https://api-mifit.zepp.com",
++            "https://api-mifit-us2.zepp.com",
++            "https://api-mifit-us.zepp.com",
++            "https://api-mifit-de.zepp.com",
++            "https://api-mifit.huami.com"
++        )
++        var lastError: String = "unknown"
++        for (host in hosts) {
++            for (appName in appNames) {
++                val url = host + pathAndQuery
++                val request = Request.Builder()
++                    .url(url)
++                    .get()
++                    .header("apptoken", appToken)
++                    .header("appname", appName)
++                    .header("app_name", appName)
++                    .header("appPlatform", "android_phone")
++                    .header("User-Agent", "Zepp/9.12.5 (Android 12)")
++                    .header("Accept", "application/json")
++                    .build()
++                try {
++                    http.newCall(request).execute().use { response ->
++                        val text = response.body?.string().orEmpty()
++                        if (response.isSuccessful) {
++                            Log.i(TAG, "OK $host appname=$appName")
++                            return JSONObject(text)
++                        }
++                        lastError = "HTTP ${response.code} @ $host/$appName: ${text.take(120)}"
++                        Log.w(TAG, lastError)
++                        // 401/403 → try next combo; other errors still try a bit
++                        if (response.code !in listOf(401, 403, 404)) {
++                            // keep trying
++                        }
++                    }
++                } catch (e: Exception) {
++                    lastError = "$host: ${e.message}"
++                    Log.w(TAG, lastError)
++                }
+             }
+-            return JSONObject(text)
+         }
++        val tokenLen = appToken.length
++        throw IllegalStateException(
++            "Все варианты host/appname отклонены. tokenLen=$tokenLen. Последняя: $lastError. " +
++                "Выйдите и войдите снова (нужен mobile app_token)."
++        )
+     }
+ 
+     private fun titleFor(type: Int, id: String): String {
+@@ -169,9 +208,6 @@ class ZeppCloudRepositoryImpl(
+ 
+     companion object {
+         private const val TAG = "ZeppRepo"
+-        // Regional hosts often work via this global front; adjust if needed.
+-        private const val DATA_HOST = "https://api-mifit.zepp.com"
+-
+         fun defaultDataClient(): OkHttpClient =
+             OkHttpClient.Builder()
+                 .connectTimeout(20, TimeUnit.SECONDS)

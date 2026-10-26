@@ -1,6 +1,7 @@
 package org.definitly.trextrack
 
 import android.app.Activity
+import android.util.Log
 import android.app.AlertDialog
 import android.content.Intent
 import android.net.Uri
@@ -26,6 +27,8 @@ class MainActivity : Activity() {
     private lateinit var connectButton: Button
     private lateinit var logoutButton: Button
     private var importedGpx: String? = null
+    private var workouts: List<WorkoutSummary> = emptyList()
+    private var selectedWorkoutId: String? = null
 
     private val openGpx = 1001
     private val saveGpx = 1002
@@ -81,6 +84,22 @@ class MainActivity : Activity() {
             }
         }
         content.addView(logoutButton, matchWrap())
+
+        content.addView(TextView(this).apply {
+            text = "Тренировки Zepp"
+            textSize = 20f
+            setPadding(0, dp(24), 0, dp(8))
+        }, matchWrap())
+
+        content.addView(Button(this).apply {
+            text = "Загрузить список тренировок"
+            setOnClickListener { loadWorkouts() }
+        }, matchWrap())
+
+        content.addView(Button(this).apply {
+            text = "Экспорт выбранной в GPX"
+            setOnClickListener { exportSelectedWorkout() }
+        }, matchWrap())
 
         content.addView(TextView(this).apply {
             text = "Локальный GPX"
@@ -200,6 +219,7 @@ class MainActivity : Activity() {
     }
 
     private fun doLogin(account: String, password: CharArray) {
+        Log.i("TrexTrack", "doLogin start accountLen=${account.length}")
         status.text = "Авторизация…"
         connectButton.isEnabled = false
         logoutButton.isEnabled = false
@@ -209,6 +229,7 @@ class MainActivity : Activity() {
                     repository.authenticate(account, password)
                 }
             } catch (t: Throwable) {
+                Log.e("TrexTrack", "doLogin failed", t)
                 AuthResult.Failure(t.message ?: t.javaClass.simpleName)
             }
             when (result) {
@@ -261,6 +282,67 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Файл сохранён", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             status.text = "Ошибка сохранения: ${e.message ?: "неизвестная ошибка"}"
+        }
+    }
+
+
+    private fun loadWorkouts() {
+        if (!sessionStore.isLoggedIn()) {
+            Toast.makeText(this, "Сначала войдите в аккаунт", Toast.LENGTH_SHORT).show()
+            return
+        }
+        status.text = "Загрузка списка тренировок…"
+        scope.launch {
+            try {
+                val list = withContext(Dispatchers.IO) { repository.listWorkouts() }
+                workouts = list
+                if (list.isEmpty()) {
+                    status.text = "Тренировок не найдено"
+                    selectedWorkoutId = null
+                } else {
+                    showWorkoutPicker(list)
+                }
+            } catch (t: Throwable) {
+                Log.e("TrexTrack", "loadWorkouts", t)
+                status.text = "Ошибка списка: ${t.message}"
+            }
+        }
+    }
+
+    private fun showWorkoutPicker(list: List<WorkoutSummary>) {
+        val labels = list.map { w ->
+            val dist = w.distanceMeters?.let { String.format("%.2f км", it / 1000.0) } ?: "?"
+            val dur = w.durationSeconds?.let { "%d:%02d".format(it / 60, it % 60) } ?: "?"
+            "${w.title} · $dist · $dur"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Выберите тренировку (${list.size})")
+            .setItems(labels) { _, which ->
+                selectedWorkoutId = list[which].id
+                status.text = "Выбрано: ${list[which].title}"
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun exportSelectedWorkout() {
+        val id = selectedWorkoutId
+        if (id == null) {
+            Toast.makeText(this, "Сначала загрузите и выберите тренировку", Toast.LENGTH_SHORT).show()
+            return
+        }
+        status.text = "Скачивание GPS и сборка GPX…"
+        scope.launch {
+            try {
+                val track = withContext(Dispatchers.IO) { repository.downloadTrack(id) }
+                importedGpx = track.gpxXml
+                importedName.text = "cloud-$id.gpx"
+                status.text = "GPX готов (${track.gpxXml.length} байт). Можно сохранить."
+                Toast.makeText(this@MainActivity, "GPX готов — нажмите «Сохранить копию GPX»", Toast.LENGTH_LONG).show()
+            } catch (t: Throwable) {
+                Log.e("TrexTrack", "exportSelectedWorkout", t)
+                status.text = "Ошибка экспорта: ${t.message}"
+            }
         }
     }
 
