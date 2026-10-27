@@ -32,7 +32,7 @@ class MainActivity : Activity() {
     private lateinit var logoutButton: Button
     private var importedGpx: String? = null
     private var workouts: List<WorkoutSummary> = emptyList()
-    private var selectedWorkoutId: String? = null
+    private val selectedIds = LinkedHashSet<String>()
 
     private val openGpx = 1001
     private val saveGpx = 1002
@@ -103,12 +103,7 @@ class MainActivity : Activity() {
         }, matchWrap())
 
         content.addView(Button(this).apply {
-            text = "Экспорт выбранной в GPX"
-            setOnClickListener { exportSelectedWorkout() }
-        }, matchWrap())
-
-        content.addView(Button(this).apply {
-            text = "Экспорт всех в папку (докачка)"
+            text = "Экспорт выбранных в папку"
             setOnClickListener { beginBulkExport() }
         }, matchWrap())
 
@@ -310,7 +305,7 @@ class MainActivity : Activity() {
                 workouts = list
                 if (list.isEmpty()) {
                     status.text = "Тренировок не найдено"
-                    selectedWorkoutId = null
+                    selectedIds.clear()
                 } else {
                     showWorkoutPicker(list)
                 }
@@ -327,35 +322,46 @@ class MainActivity : Activity() {
             val dur = w.durationSeconds?.let { "%d:%02d".format(it / 60, it % 60) } ?: "?"
             "${w.title} · $dist · $dur"
         }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Выберите тренировку (${list.size})")
-            .setItems(labels) { _, which ->
-                selectedWorkoutId = list[which].id
-                status.text = "Выбрано: ${list[which].title}"
-            }
-            .setNegativeButton("Отмена", null)
-            .show()
-    }
+        // сохраняем прежний выбор только для тренировок, которые есть в новом списке
+        selectedIds.retainAll(list.map { it.id }.toSet())
+        val checked = BooleanArray(list.size) { list[it].id in selectedIds }
 
-    private fun exportSelectedWorkout() {
-        val id = selectedWorkoutId
-        if (id == null) {
-            Toast.makeText(this, "Сначала загрузите и выберите тренировку", Toast.LENGTH_SHORT).show()
-            return
-        }
-        status.text = "Скачивание GPS и сборка GPX…"
-        scope.launch {
-            try {
-                val track = withContext(Dispatchers.IO) { repository.downloadTrack(id) }
-                importedGpx = track.gpxXml
-                importedName.text = "cloud-$id.gpx"
-                status.text = "GPX готов (${track.gpxXml.length} байт). Можно сохранить."
-                Toast.makeText(this@MainActivity, "GPX готов — нажмите «Сохранить копию GPX»", Toast.LENGTH_LONG).show()
-            } catch (t: Throwable) {
-                Log.e("TrexTrack", "exportSelectedWorkout", t)
-                status.text = "Ошибка экспорта: ${t.message}"
+        fun title() = "Выбрано ${checked.count { it }} из ${list.size}"
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(title())
+            .setMultiChoiceItems(labels, checked, null)
+            .setPositiveButton("Готово", null)
+            .setNeutralButton("Выбрать все", null)
+            .setNegativeButton("Отмена", null)
+            .create()
+
+        dialog.setOnShowListener {
+            val lv = dialog.listView
+            val toggleAll = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+
+            fun refresh() {
+                for (i in checked.indices) checked[i] = lv.isItemChecked(i)
+                dialog.setTitle(title())
+                toggleAll.text = if (checked.all { it }) "Снять все" else "Выбрать все"
+            }
+            refresh()
+
+            lv.setOnItemClickListener { _, _, _, _ -> refresh() }
+            toggleAll.setOnClickListener {
+                val target = !checked.all { it }
+                for (i in checked.indices) lv.setItemChecked(i, target)
+                refresh()
+            }
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                selectedIds.clear()
+                for (i in checked.indices) if (checked[i]) selectedIds.add(list[i].id)
+                status.text = if (selectedIds.isEmpty()) "Ничего не выбрано"
+                else "Выбрано тренировок: ${selectedIds.size}. Нажмите «Экспорт выбранных в папку»"
+                dialog.dismiss()
             }
         }
+        dialog.show()
     }
 
     // ---------- Массовый экспорт ----------
@@ -367,6 +373,12 @@ class MainActivity : Activity() {
         }
         if (bulkJob?.isActive == true) {
             Toast.makeText(this, "Экспорт уже идёт", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (selectedIds.isEmpty()) {
+            Toast.makeText(
+                this, "Сначала загрузите список и отметьте тренировки", Toast.LENGTH_LONG
+            ).show()
             return
         }
         Toast.makeText(
@@ -389,14 +401,9 @@ class MainActivity : Activity() {
     private fun startBulkExport(treeUri: Uri) {
         bulkJob = scope.launch {
             try {
-                var list = workouts
+                val list = workouts.filter { it.id in selectedIds }
                 if (list.isEmpty()) {
-                    status.text = "Загрузка списка тренировок…"
-                    list = withContext(Dispatchers.IO) { repository.listWorkouts() }
-                    workouts = list
-                }
-                if (list.isEmpty()) {
-                    status.text = "Тренировок не найдено"
+                    status.text = "Нет выбранных тренировок"
                     return@launch
                 }
                 val result = withContext(Dispatchers.IO) {
