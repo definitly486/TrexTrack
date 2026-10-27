@@ -467,7 +467,7 @@ class MainActivity : Activity() {
 
     private fun listExistingNames(treeUri: Uri, treeDocId: String): Set<String> {
         val names = HashSet<String>()
-        val children = DocumentsContract.buildChildDocumentsUriForTreeDocument(treeUri, treeDocId)
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId)
         contentResolver.query(
             children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null
         )?.use { c ->
