@@ -31,3 +31,20 @@ data class GpxTrack(
     val workoutId: String,
     val gpxXml: String
 )
+
+/** Ошибка загрузки трека с понятной категорией — чтобы в отчёте видеть, ПОЧЕМУ трек не скачался. */
+class TrackDownloadException(
+    val kind: Kind,
+    message: String,
+    cause: Throwable? = null
+) : Exception(message, cause) {
+    enum class Kind(val label: String, val retryable: Boolean) {
+        NO_GPS("нет GPS-данных", false),
+        NOT_FOUND("не найдено (404)", false),
+        AUTH("сессия отклонена (401/403)", false),
+        PARSE("неожиданный ответ", false),
+        RATE_LIMIT("лимит запросов (429)", true),
+        SERVER("ошибка сервера (5xx)", true),
+        NETWORK("сеть / таймаут", true)
+    }
+}

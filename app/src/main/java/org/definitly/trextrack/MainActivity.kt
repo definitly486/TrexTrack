@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.text.InputType
 import android.view.ViewGroup
 import android.widget.Button
@@ -16,7 +17,10 @@ import android.widget.TextView
 import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -32,6 +36,8 @@ class MainActivity : Activity() {
 
     private val openGpx = 1001
     private val saveGpx = 1002
+    private val pickExportDir = 1003
+    private var bulkJob: Job? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var sessionStore: SessionStore
@@ -99,6 +105,11 @@ class MainActivity : Activity() {
         content.addView(Button(this).apply {
             text = "Экспорт выбранной в GPX"
             setOnClickListener { exportSelectedWorkout() }
+        }, matchWrap())
+
+        content.addView(Button(this).apply {
+            text = "Экспорт всех в папку (докачка)"
+            setOnClickListener { beginBulkExport() }
         }, matchWrap())
 
         content.addView(TextView(this).apply {
@@ -254,6 +265,7 @@ class MainActivity : Activity() {
         when (requestCode) {
             openGpx -> readGpx(uri)
             saveGpx -> writeGpx(uri)
+            pickExportDir -> startBulkExport(uri)
         }
     }
 
@@ -344,6 +356,159 @@ class MainActivity : Activity() {
                 status.text = "Ошибка экспорта: ${t.message}"
             }
         }
+    }
+
+    // ---------- Массовый экспорт ----------
+
+    private fun beginBulkExport() {
+        if (!sessionStore.isLoggedIn()) {
+            Toast.makeText(this, "Сначала войдите в аккаунт", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (bulkJob?.isActive == true) {
+            Toast.makeText(this, "Экспорт уже идёт", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Toast.makeText(
+            this,
+            "Выберите папку. Уже скачанные файлы будут пропущены — можно запускать повторно",
+            Toast.LENGTH_LONG
+        ).show()
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), pickExportDir)
+    }
+
+    private class BulkResult(
+        val total: Int,
+        val saved: Int,
+        val skipped: Int,
+        val failures: Map<TrackDownloadException.Kind, List<String>>
+    ) {
+        val failed get() = failures.values.sumOf { it.size }
+    }
+
+    private fun startBulkExport(treeUri: Uri) {
+        bulkJob = scope.launch {
+            try {
+                var list = workouts
+                if (list.isEmpty()) {
+                    status.text = "Загрузка списка тренировок…"
+                    list = withContext(Dispatchers.IO) { repository.listWorkouts() }
+                    workouts = list
+                }
+                if (list.isEmpty()) {
+                    status.text = "Тренировок не найдено"
+                    return@launch
+                }
+                val result = withContext(Dispatchers.IO) {
+                    runBulkExport(treeUri, list) { done, total, saved, failed ->
+                        runOnUiThread {
+                            status.text = "Экспорт $done/$total · сохранено $saved · ошибок $failed"
+                        }
+                    }
+                }
+                showBulkSummary(result)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.e("TrexTrack", "bulkExport", t)
+                status.text = "Ошибка массового экспорта: ${t.message}"
+            }
+        }
+    }
+
+    private suspend fun runBulkExport(
+        treeUri: Uri,
+        list: List<WorkoutSummary>,
+        onProgress: (done: Int, total: Int, saved: Int, failed: Int) -> Unit
+    ): BulkResult {
+        val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val dirUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocId)
+        val existing = listExistingNames(treeUri, treeDocId)
+
+        var saved = 0
+        var skipped = 0
+        val failures = LinkedHashMap<TrackDownloadException.Kind, MutableList<String>>()
+
+        for ((index, w) in list.withIndex()) {
+            val fileName = "Zepp-${w.id}.gpx"
+            if (fileName in existing) {
+                skipped++
+            } else {
+                var attempt = 0
+                while (true) {
+                    attempt++
+                    try {
+                        val track = repository.downloadTrack(w.id)
+                        writeTrackFile(dirUri, fileName, track.gpxXml)
+                        saved++
+                        break
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        val kind = (e as? TrackDownloadException)?.kind
+                            ?: TrackDownloadException.Kind.NETWORK
+                        if (kind.retryable && attempt < 3) {
+                            delay(2000L * attempt)
+                            continue
+                        }
+                        Log.w("TrexTrack", "export ${w.id} failed: ${kind.label}: ${e.message}")
+                        failures.getOrPut(kind) { mutableListOf() }
+                            .add("${w.title}: ${e.message}")
+                        break
+                    }
+                }
+                delay(300) // не долбим API — иначе сервер начинает отвечать 429/5xx
+            }
+            val failed = failures.values.sumOf { it.size }
+            onProgress(index + 1, list.size, saved, failed)
+        }
+        return BulkResult(list.size, saved, skipped, failures)
+    }
+
+    private fun listExistingNames(treeUri: Uri, treeDocId: String): Set<String> {
+        val names = HashSet<String>()
+        val children = DocumentsContract.buildChildDocumentsUriForTreeDocument(treeUri, treeDocId)
+        contentResolver.query(
+            children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null
+        )?.use { c ->
+            while (c.moveToNext()) c.getString(0)?.let { names.add(it) }
+        }
+        return names
+    }
+
+    private fun writeTrackFile(dirUri: Uri, fileName: String, gpx: String) {
+        val doc = DocumentsContract.createDocument(
+            contentResolver, dirUri, "application/octet-stream", fileName
+        ) ?: throw IllegalStateException("Не удалось создать файл $fileName")
+        try {
+            contentResolver.openOutputStream(doc, "w")?.bufferedWriter(Charsets.UTF_8)?.use { it.write(gpx) }
+                ?: error("Не удалось открыть $fileName для записи")
+        } catch (e: Exception) {
+            // не оставляем «пустышку», иначе при докачке файл посчитается скачанным
+            try { DocumentsContract.deleteDocument(contentResolver, doc) } catch (ignored: Exception) {}
+            throw e
+        }
+    }
+
+    private fun showBulkSummary(r: BulkResult) {
+        val noGps = r.failures[TrackDownloadException.Kind.NO_GPS]?.size ?: 0
+        val realFailed = r.failed - noGps
+        status.text = "Экспорт завершён: сохранено ${r.saved}, уже было ${r.skipped}, " +
+            "без GPS $noGps, ошибок $realFailed (всего ${r.total})"
+
+        val sb = StringBuilder()
+        if (r.failures.isEmpty()) sb.append("Все тренировки обработаны без ошибок.")
+        for ((kind, items) in r.failures) {
+            sb.append("• ${kind.label}: ${items.size}\n")
+            items.take(3).forEach { sb.append("    ${it.take(110)}\n") }
+            if (items.size > 3) sb.append("    … ещё ${items.size - 3}\n")
+        }
+        if (realFailed > 0) sb.append("\nЗапустите экспорт ещё раз в ту же папку — докачаются только недостающие.")
+        AlertDialog.Builder(this)
+            .setTitle("Итоги экспорта")
+            .setMessage(sb.toString())
+            .setPositiveButton("OK", null)
+            .show()
     }
 
     private fun suggestedFileName(label: String): String {
