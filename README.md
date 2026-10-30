@@ -8,11 +8,9 @@ Android/Kotlin starter project for a standalone GPX exporter targeting Amazfit T
 
 Текущий UI:
 
-- вход по email/телефону и паролю;
-- сохранение `app_token` / `login_token` / `user_id` в Keystore-backed хранилище;
-- список тренировок из облака Zepp и экспорт GPS-треков в GPX;
-- локальный открытие/сохранение GPX;
-- **новая страница «Работа напрямую с часами»**: BLE-сканирование, подключение GATT к Amazfit T-Rex 2, обнаружение сервисов, ввод Huami auth key, каркас загрузки треков с часов.
+- **главный экран** — две кнопки: облако Zepp / напрямую с часами;
+- **облако** (`CloudActivity`): вход, сессия в Keystore, список тренировок, экспорт GPX, локальный GPX (как до рефакторинга);
+- **часы** (`WatchDirectActivity`): BLE-сканирование, GATT, Huami auth key, каркас загрузки треков с часов.
 
 ## Прямая работа с часами
 

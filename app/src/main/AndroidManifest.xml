@@ -26,6 +26,10 @@
             </intent-filter>
         </activity>
         <activity
+            android:name=".CloudActivity"
+            android:exported="false"
+            android:label="Облако Zepp" />
+        <activity
             android:name=".WatchDirectActivity"
             android:exported="false"
             android:label="Часы (прямое подключение)" />
