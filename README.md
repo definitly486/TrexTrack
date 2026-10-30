@@ -10,9 +10,21 @@ Android/Kotlin starter project for a standalone GPX exporter targeting Amazfit T
 
 - вход по email/телефону и паролю;
 - сохранение `app_token` / `login_token` / `user_id` в Keystore-backed хранилище;
-- локальный открытие/сохранение GPX.
+- список тренировок из облака Zepp и экспорт GPS-треков в GPX;
+- локальный открытие/сохранение GPX;
+- **новая страница «Работа напрямую с часами»**: BLE-сканирование, подключение GATT к Amazfit T-Rex 2, обнаружение сервисов, ввод Huami auth key, каркас загрузки треков с часов.
 
-Список тренировок и скачивание GPS-треков — следующий этап.
+## Прямая работа с часами
+
+Кнопка на главном экране открывает `WatchDirectActivity`:
+
+1. **Сканировать BLE** — поиск устройств (имена с T-Rex / Amazfit / Zepp / Huami).
+2. Выбор устройства из списка.
+3. **Подключить** — GATT connect + service discovery (отображаются UUID и свойства характеристик).
+4. **Ввести Huami auth key** — опционально; для T-Rex 2 обычно нужен (как в Gadgetbridge; ключ можно получить через `huami-token` после привязки в Zepp).
+5. **Загрузить треки с часов** — каркас: проверяет соединение, наличие Huami-сервисов (`fee0`/`fee1`) и auth key; полный протокол выгрузки activity + GPS points — следующий этап (референс: Gadgetbridge Zepp OS).
+
+Загрузка треков **из облака** уже реализована на главном экране; эта страница именно для прямого BLE.
 
 ## Build
 
@@ -35,11 +47,12 @@ Release signing is optional: set `TREXTRACK_STORE_FILE`, `TREXTRACK_STORE_PASSWO
 
 1. ~~Validate direct Zepp account login without the Zepp app.~~
 2. ~~Store refresh/session tokens in Android Keystore-backed storage; never log credentials.~~
-3. Implement paginated workout history.
-4. Download GPS route points and map them to GPX 1.1 (`trk`, `trkseg`, `trkpt`, optional `ele` and `time`).
-5. Add date filters, bulk export, duplicate detection and error/retry handling.
+3. ~~Implement paginated workout history.~~
+4. ~~Download GPS route points and map them to GPX 1.1 (`trk`, `trkseg`, `trkpt`, optional `ele` and `time`).~~
+5. Add date filters, bulk export, duplicate detection and error/retry handling (частично есть).
 6. Test with real T-Rex 2 workouts and compare coordinate count/time/elevation against source data.
+7. **Прямая синхронизация с часов**: порт логики activity/GPS sync с Huami-протокола (Gadgetbridge) поверх уже реализованного GATT + auth key.
 
 ## No Zepp dependency
 
-There is no Zepp SDK, Zepp app package reference, Google Play Services dependency, or backend service in this project. Auth uses the same public HTTPS endpoints as community tools (encrypted credential exchange + token exchange).
+There is no Zepp SDK, Zepp app package reference, Google Play Services dependency, or backend service in this project. Auth uses the same public HTTPS endpoints as community tools (encrypted credential exchange + token exchange). Direct watch path uses only Android BLE APIs.

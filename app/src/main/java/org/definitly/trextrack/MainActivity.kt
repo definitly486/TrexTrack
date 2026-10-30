@@ -91,6 +91,13 @@ class MainActivity : Activity() {
         }
         content.addView(logoutButton, matchWrap())
 
+        content.addView(Button(this).apply {
+            text = "Работа напрямую с часами (T-Rex 2)"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, WatchDirectActivity::class.java))
+            }
+        }, matchWrap())
+
         content.addView(TextView(this).apply {
             text = "Тренировки Zepp"
             textSize = 20f
