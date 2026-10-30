@@ -53,29 +53,36 @@ jobs:
           echo "Found: $APK"
           ls -lh "$APK"
 
-      - name: Rename APK for release
-        id: release_apk
+      - name: Prepare names
+        id: meta
         run: |
           BRANCH="${GITHUB_REF_NAME//\//-}"
+          BRANCH="${BRANCH//[^a-zA-Z0-9._-]/-}"
           SHORT_SHA="${GITHUB_SHA::7}"
           OUT="TrexTrack-debug-${BRANCH}-${SHORT_SHA}.apk"
+          ARTIFACT="TrexTrack-debug-${BRANCH}-${SHORT_SHA}"
+          TAG="debug-${BRANCH}-${GITHUB_RUN_NUMBER}"
           cp "${{ steps.apk.outputs.path }}" "$OUT"
           echo "path=$OUT" >> "$GITHUB_OUTPUT"
           echo "name=$OUT" >> "$GITHUB_OUTPUT"
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Prepared: $OUT / artifact=$ARTIFACT / tag=$TAG"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TrexTrack-debug-${{ github.ref_name }}-${{ github.sha }}
-          path: ${{ steps.release_apk.outputs.path }}
+          name: ${{ steps.meta.outputs.artifact }}
+          path: ${{ steps.meta.outputs.path }}
           if-no-files-found: error
           retention-days: 30
 
       - name: Publish GitHub Release (pre-release)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: debug-${{ github.ref_name }}-${{ github.run_number }}
-          name: Debug APK · ${{ github.ref_name }} · #${{ github.run_number }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Debug APK · ${{ steps.meta.outputs.branch }} · #${{ github.run_number }}
           body: |
             Автосборка debug APK после push.
 
@@ -85,9 +92,9 @@ jobs:
 
             Установка:
             ```bash
-            adb install -r ${{ steps.release_apk.outputs.name }}
+            adb install -r ${{ steps.meta.outputs.name }}
             ```
-          files: ${{ steps.release_apk.outputs.path }}
+          files: ${{ steps.meta.outputs.path }}
           prerelease: true
           generate_release_notes: true
         env:
