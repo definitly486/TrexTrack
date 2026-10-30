@@ -11,7 +11,16 @@ interface ZeppCloudRepository {
     suspend fun authenticate(account: String, credential: CharArray): AuthResult
     suspend fun listWorkouts(): List<WorkoutSummary>
     suspend fun downloadTrack(workoutId: String): GpxTrack
+    suspend fun listBoundDevices(): List<BoundDevice>
 }
+
+/** Привязанное к аккаунту Zepp устройство и его BLE auth key. */
+data class BoundDevice(
+    val macAddress: String,
+    val authKeyHex: String,
+    val active: Boolean,
+    val label: String
+)
 
 sealed interface AuthResult {
     data object Success : AuthResult

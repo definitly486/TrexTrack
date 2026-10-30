@@ -34,6 +34,11 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.util.UUID
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Страница прямой работы с часами Amazfit T-Rex 2 (и совместимыми Zepp OS).
@@ -73,6 +78,11 @@ class WatchDirectActivity : Activity() {
 
     /** Huami / Amazfit auth key (hex), optional — required for authenticated sync on T-Rex 2. */
     private var authKeyHex: String? = null
+    private lateinit var sessionStore: SessionStore
+    private lateinit var repository: ZeppCloudRepositoryImpl
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private lateinit var fetchKeyButton: Button
+    private lateinit var keyStatusView: TextView
 
     // Common Huami / Zepp OS related UUIDs (informational)
     private val HUAMI_SERVICE = UUID.fromString("0000fee0-0000-1000-8000-00805f9b34fb")
@@ -138,11 +148,23 @@ class WatchDirectActivity : Activity() {
         }
         content.addView(connectButton, matchWrap())
 
+        fetchKeyButton = Button(this).apply {
+            text = "Получить auth key из аккаунта Zepp"
+            setOnClickListener { fetchAuthKeyFromCloud() }
+        }
+        content.addView(fetchKeyButton, matchWrap())
+
         authKeyButton = Button(this).apply {
-            text = "Ввести Huami auth key"
+            text = "Ввести Huami auth key вручную"
             setOnClickListener { showAuthKeyDialog() }
         }
         content.addView(authKeyButton, matchWrap())
+
+        keyStatusView = TextView(this).apply {
+            textSize = 13f
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        content.addView(keyStatusView, matchWrap())
 
         loadTracksButton = Button(this).apply {
             text = "Загрузить треки с часов"
@@ -186,6 +208,11 @@ class WatchDirectActivity : Activity() {
             text = "← Назад"
             setOnClickListener { finish() }
         }, matchWrap())
+
+        sessionStore = SessionStore(this)
+        repository = ZeppCloudRepositoryImpl(sessionStore)
+        authKeyHex = sessionStore.getAuthKey()
+        refreshKeyStatus()
 
         val bm = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bm.adapter
@@ -523,12 +550,17 @@ class WatchDirectActivity : Activity() {
             )
             .setView(input)
             .setPositiveButton("Сохранить") { _, _ ->
-                val v = input.text?.toString()?.trim()?.replace(" ", "")?.lowercase().orEmpty()
-                authKeyHex = if (v.isBlank()) null else v
-                setStatus(
-                    if (authKeyHex != null) "Auth key сохранён (${authKeyHex!!.length} символов)"
-                    else "Auth key очищен"
-                )
+                val v = input.text?.toString()?.trim()?.replace(" ", "")?.lowercase().orEmpty().removePrefix("0x")
+                if (v.isBlank()) {
+                    authKeyHex = null
+                    sessionStore.clearAuthKey()
+                    setStatus("Auth key очищен")
+                } else {
+                    authKeyHex = v
+                    sessionStore.saveAuthKey(v, null)
+                    setStatus("Auth key сохранён (${v.length} символов)")
+                }
+                refreshKeyStatus()
             }
             .setNegativeButton("Отмена", null)
             .show()
@@ -602,6 +634,103 @@ class WatchDirectActivity : Activity() {
         ViewGroup.LayoutParams.MATCH_PARENT,
         ViewGroup.LayoutParams.WRAP_CONTENT
     ).also { it.bottomMargin = dp(8) }
+
+
+    private fun refreshKeyStatus() {
+        if (!::keyStatusView.isInitialized) return
+        val key = authKeyHex ?: sessionStore.getAuthKey()
+        val mac = sessionStore.getAuthKeyMac()
+        keyStatusView.text = when {
+            key.isNullOrBlank() -> "Auth key: не задан (нужен для полной работы с часами)"
+            else -> {
+                val short = if (key.length > 12) key.take(6) + "…" + key.takeLast(4) else key
+                val macPart = if (mac.isNullOrBlank()) "" else " · MAC $mac"
+                "Auth key: $short (${key.length} hex)$macPart"
+            }
+        }
+        keyStatusView.setTextColor(if (key.isNullOrBlank()) 0xFF8A3B12.toInt() else 0xFF1B5E20.toInt())
+    }
+
+    /**
+     * Загрузка BLE auth key с серверов Zepp для устройств, уже привязанных к аккаунту.
+     * Часы рядом не нужны — достаточно сессии (вход на экране «Облако»).
+     */
+    private fun fetchAuthKeyFromCloud() {
+        if (!sessionStore.isLoggedIn()) {
+            AlertDialog.Builder(this)
+                .setTitle("Нужен вход в Zepp")
+                .setMessage(
+                    "Сначала войдите в аккаунт на экране «Работа с облаком Zepp». " +
+                        "Auth key берётся из списка привязанных устройств вашего аккаунта."
+                )
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        setStatus("Загрузка устройств и auth key…")
+        fetchKeyButton.isEnabled = false
+        scope.launch {
+            try {
+                val devices = withContext(Dispatchers.IO) {
+                    repository.listBoundDevices()
+                }
+                if (devices.isEmpty()) {
+                    setStatus("Устройств в аккаунте не найдено", error = true)
+                    Toast.makeText(this@WatchDirectActivity, "Нет привязанных устройств", Toast.LENGTH_LONG).show()
+                    return@launch
+                }
+                val withKey = devices.filter { it.authKeyHex.isNotBlank() }
+                if (withKey.isEmpty()) {
+                    setStatus("Устройства есть, но auth_key пустой", error = true)
+                    val detail = devices.joinToString("\n") { "${it.macAddress} · ${it.label}" }
+                    AlertDialog.Builder(this@WatchDirectActivity)
+                        .setTitle("Нет auth_key")
+                        .setMessage(
+                            "Сервер вернул устройства без auth_key:\n$detail\n\n" +
+                                "Убедитесь, что часы привязаны через Zepp и хотя бы раз синхронизировались."
+                        )
+                        .setPositiveButton("OK", null)
+                        .show()
+                    return@launch
+                }
+                if (withKey.size == 1) {
+                    applyAuthKey(withKey[0])
+                } else {
+                    val labels = withKey.map { d ->
+                        val act = if (d.active) "active" else "inactive"
+                        "${d.macAddress} ($act) · ${d.label}"
+                    }.toTypedArray()
+                    AlertDialog.Builder(this@WatchDirectActivity)
+                        .setTitle("Выберите устройство")
+                        .setItems(labels) { _, which ->
+                            applyAuthKey(withKey[which])
+                        }
+                        .setNegativeButton("Отмена", null)
+                        .show()
+                    setStatus("Выберите устройство из списка")
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "fetchAuthKeyFromCloud", t)
+                setStatus("Ошибка: ${t.message}", error = true)
+                Toast.makeText(this@WatchDirectActivity, t.message ?: "Ошибка", Toast.LENGTH_LONG).show()
+            } finally {
+                fetchKeyButton.isEnabled = true
+            }
+        }
+    }
+
+    private fun applyAuthKey(device: BoundDevice) {
+        authKeyHex = device.authKeyHex
+        sessionStore.saveAuthKey(device.authKeyHex, device.macAddress)
+        refreshKeyStatus()
+        setStatus("Auth key получен для ${device.macAddress}", ok = true)
+        Toast.makeText(
+            this,
+            "Ключ сохранён (${device.authKeyHex.length} hex) для ${device.macAddress}",
+            Toast.LENGTH_LONG
+        ).show()
+        Log.i(TAG, "auth key saved mac=${device.macAddress} len=${device.authKeyHex.length}")
+    }
 
     companion object {
         private const val TAG = "WatchDirect"

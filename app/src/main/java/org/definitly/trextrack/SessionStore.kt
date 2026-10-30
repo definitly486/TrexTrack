@@ -50,6 +50,23 @@ class SessionStore(context: Context) {
     fun getAccountHint(): String? = prefs.getString(KEY_ACCOUNT_HINT, null)
     fun isEncryptedStorage(): Boolean = encrypted
 
+    fun getAuthKey(): String? = prefs.getString(KEY_AUTH_KEY, null)
+    fun getAuthKeyMac(): String? = prefs.getString(KEY_AUTH_KEY_MAC, null)
+
+    fun saveAuthKey(hexKey: String, mac: String?) {
+        prefs.edit()
+            .putString(KEY_AUTH_KEY, hexKey.trim().lowercase().removePrefix("0x"))
+            .putString(KEY_AUTH_KEY_MAC, mac)
+            .apply()
+    }
+
+    fun clearAuthKey() {
+        prefs.edit()
+            .remove(KEY_AUTH_KEY)
+            .remove(KEY_AUTH_KEY_MAC)
+            .apply()
+    }
+
     fun saveSession(
         appToken: String,
         loginToken: String,
@@ -76,5 +93,7 @@ class SessionStore(context: Context) {
         private const val KEY_LOGIN_TOKEN = "login_token"
         private const val KEY_USER_ID = "user_id"
         private const val KEY_ACCOUNT_HINT = "account_hint"
+        private const val KEY_AUTH_KEY = "watch_auth_key"
+        private const val KEY_AUTH_KEY_MAC = "watch_auth_key_mac"
     }
 }
