@@ -43,6 +43,16 @@ JAVA_TOOL_OPTIONS=-Dos.name=Linux ./gradlew assembleDebug
 
 Release signing is optional: set `TREXTRACK_STORE_FILE`, `TREXTRACK_STORE_PASSWORD`, `TREXTRACK_KEY_ALIAS`, `TREXTRACK_KEY_PASSWORD` only when you need a signed release APK.
 
+## CI (GitHub Actions)
+
+После каждого push workflow **Debug APK** (`.github/workflows/debug-build.yml`):
+
+1. Собирает `assembleDebug` на Ubuntu (JDK 17).
+2. Загружает APK как artifact в Actions.
+3. Публикует pre-release с тегом `debug-<branch>-<run_number>` и прикреплённым APK.
+
+Артефакты и релизы: вкладка **Actions** / **Releases** репозитория.
+
 ## Planned implementation
 
 1. ~~Validate direct Zepp account login without the Zepp app.~~

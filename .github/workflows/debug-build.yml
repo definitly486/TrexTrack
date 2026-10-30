@@ -1,0 +1,94 @@
+name: Debug APK
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: debug-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Assemble debug APK
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+        env:
+          JAVA_TOOL_OPTIONS: -Dos.name=Linux
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n1)
+          if [ -z "$APK" ]; then
+            echo "APK not found"
+            ls -laR app/build/outputs || true
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$APK")" >> "$GITHUB_OUTPUT"
+          echo "Found: $APK"
+          ls -lh "$APK"
+
+      - name: Rename APK for release
+        id: release_apk
+        run: |
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          OUT="TrexTrack-debug-${BRANCH}-${SHORT_SHA}.apk"
+          cp "${{ steps.apk.outputs.path }}" "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+          echo "name=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrexTrack-debug-${{ github.ref_name }}-${{ github.sha }}
+          path: ${{ steps.release_apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release (pre-release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-${{ github.ref_name }}-${{ github.run_number }}
+          name: Debug APK · ${{ github.ref_name }} · #${{ github.run_number }}
+          body: |
+            Автосборка debug APK после push.
+
+            - **Branch:** `${{ github.ref_name }}`
+            - **Commit:** `${{ github.sha }}`
+            - **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            Установка:
+            ```bash
+            adb install -r ${{ steps.release_apk.outputs.name }}
+            ```
+          files: ${{ steps.release_apk.outputs.path }}
+          prerelease: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
