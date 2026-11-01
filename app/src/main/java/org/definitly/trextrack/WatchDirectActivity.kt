@@ -96,6 +96,17 @@ class WatchDirectActivity : Activity() {
     private val activityBuffer = ArrayList<ByteArray>()
     private var pendingDescriptorWrites = 0
     private var loadInProgress = false
+    private var finishPosted = false
+
+    // Zepp OS / Huami 2021 chunked auth
+    private var chunkedEncoder: Huami2021ChunkedEncoder? = null
+    private var chunkedDecoder: Huami2021ChunkedDecoder? = null
+    private var ecdhPrivate: ByteArray? = null
+    private var ecdhPublic: ByteArray? = null
+    private var sessionAesKey: ByteArray? = null
+    private var zeppAuthInProgress = false
+    private val gattWriteQueue = ArrayDeque<Pair<BluetoothGattCharacteristic, ByteArray>>()
+    private var gattWriteInFlight = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -537,12 +548,7 @@ class WatchDirectActivity : Activity() {
             if (pendingDescriptorWrites > 0) {
                 pendingDescriptorWrites--
             }
-            if (pendingDescriptorWrites == 0 && loadInProgress &&
-                authState == HuamiBleProtocol.AuthState.IDLE
-            ) {
-                // Notifications enabled → start classic auth
-                handler.post { startClassicAuth(g) }
-            }
+            // Auth is started by enableNextNotification chain when all CCCDs are done
         }
 
         @SuppressLint("MissingPermission")
@@ -557,19 +563,14 @@ class WatchDirectActivity : Activity() {
             when (uuid) {
                 HuamiBleProtocol.CHAR_AUTH -> handleAuthNotification(g, value)
                 HuamiBleProtocol.CHAR_ACTIVITY_DATA -> handleActivityData(value)
-                else -> {
-                    // Chunked / Zepp OS transfer — log for future parser
-                    if (uuid == HuamiBleProtocol.CHAR_CHUNKED_2021_READ ||
-                        uuid == HuamiBleProtocol.CHAR_ZEPP_FT_RECV
-                    ) {
-                        activityBytesReceived += value.size
-                        activityBuffer.add(value.copyOf())
-                        runOnUiThread {
-                            setStatus(
-                                "Zepp/chunked данные: ${activityBytesReceived} байт " +
-                                    "(${activityBuffer.size} пакетов) — парсер GPS следующий этап"
-                            )
-                        }
+                HuamiBleProtocol.CHAR_CHUNKED_2021_READ -> handleChunked2021Notify(g, value)
+                HuamiBleProtocol.CHAR_ZEPP_FT_RECV -> {
+                    activityBytesReceived += value.size
+                    activityBuffer.add(value.copyOf())
+                    runOnUiThread {
+                        setStatus(
+                            "Zepp FT: ${activityBytesReceived} байт (${activityBuffer.size} пак.)"
+                        )
                     }
                 }
             }
@@ -586,6 +587,9 @@ class WatchDirectActivity : Activity() {
                     setStatus("Write failed ${characteristic.uuid.toString().take(8)}…: $status", error = true)
                 }
             }
+            // Drain GATT write queue (chunked frames must be sequential)
+            gattWriteInFlight = false
+            pumpGattWriteQueue(g)
         }
 
         override fun onCharacteristicRead(
@@ -710,6 +714,9 @@ class WatchDirectActivity : Activity() {
         activityBytesReceived = 0
         activityBuffer.clear()
         loadInProgress = true
+        finishPosted = false
+        zeppAuthInProgress = false
+        sessionAesKey = null
         loadTracksButton.isEnabled = false
 
         setStatus(
@@ -752,8 +759,7 @@ class WatchDirectActivity : Activity() {
         index: Int
     ) {
         if (index >= list.size) {
-            // All done — start auth
-            handler.post { startClassicAuth(g) }
+            handler.post { beginAuth(g) }
             return
         }
         val c = list[index]
@@ -761,41 +767,237 @@ class WatchDirectActivity : Activity() {
         val ok = HuamiBleProtocol.enableNotifications(g, c)
         if (!ok) {
             Log.w(TAG, "enableNotifications failed for ${c.uuid}")
-            // continue with next
             handler.post { enableNextNotification(g, list, index + 1) }
             return
         }
-        // Wait for onDescriptorWrite, then continue
-        // Store continuation via a one-shot runnable on next descriptor write
-        // Simpler approach: chain with delay fallback
+        // Chain sequentially; onDescriptorWrite is only informational
         handler.postDelayed({
-            if (pendingDescriptorWrites > 0) {
-                pendingDescriptorWrites = 0
-                enableNextNotification(g, list, index + 1)
-            } else {
-                // onDescriptorWrite already decremented; continue chain
-                enableNextNotification(g, list, index + 1)
+            pendingDescriptorWrites = 0
+            enableNextNotification(g, list, index + 1)
+        }, 350)
+    }
+
+    /** Choose classic AES or Zepp OS ECDH based on discovered characteristics. */
+    @SuppressLint("MissingPermission")
+    private fun beginAuth(g: BluetoothGatt) {
+        val classic = HuamiBleProtocol.hasClassicAuth(g)
+        val zepp = HuamiBleProtocol.hasZeppOsTransfer(g)
+        Log.i(TAG, "beginAuth classic=$classic zepp=$zepp")
+        when {
+            zepp && !classic -> startZeppOsAuth(g)
+            classic -> startClassicAuth(g)
+            zepp -> startZeppOsAuth(g)
+            else -> {
+                setStatus("Нет AUTH / chunked 2021 — auth невозможен", error = true)
+                finishLoadWithSummary(false, "нет auth characteristics")
             }
-        }, 400)
+        }
+    }
+
+    /**
+     * Zepp OS / Huami 2021 ECDH auth (InitOperation2021).
+     * Endpoint 0x0082 over chunked 2021 WRITE/READ characteristics.
+     */
+    @SuppressLint("MissingPermission")
+    private fun startZeppOsAuth(g: BluetoothGatt) {
+        val writeChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_WRITE)
+        val readChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_READ)
+        val key = authKeyBytes
+        if (writeChar == null || readChar == null || key == null) {
+            finishLoadWithSummary(false, "нет CH2021 write/read или auth key")
+            return
+        }
+
+        val enc = Huami2021ChunkedEncoder(23)
+        val dec = Huami2021ChunkedDecoder({ type, payload ->
+            handleZeppAuthPayload(g, type, payload)
+        }, force2021Protocol = true)
+        chunkedEncoder = enc
+        chunkedDecoder = dec
+        zeppAuthInProgress = true
+        finishPosted = false
+
+        // Generate ECDH key pair (curve B-163)
+        val priv = ByteArray(24)
+        java.security.SecureRandom().nextBytes(priv)
+        ecdhPrivate = priv
+        val pub = ECDH_B163.ecdh_generate_public(priv)
+        ecdhPublic = pub
+        if (pub == null || pub.size < 48) {
+            finishLoadWithSummary(false, "ECDH public key generation failed")
+            return
+        }
+
+        setStatus("Zepp OS auth: отправка ECDH public key…")
+        // Command: 04 02 00 02 + 48-byte public key
+        val sendPub = ByteArray(52)
+        sendPub[0] = 0x04
+        sendPub[1] = 0x02
+        sendPub[2] = 0x00
+        sendPub[3] = 0x02
+        System.arraycopy(pub, 0, sendPub, 4, 48)
+
+        gattWriteQueue.clear()
+        gattWriteInFlight = false
+        enc.write(
+            chunkWriter = { chunk ->
+                Log.d(TAG, "CH2021 queue chunk len=${chunk.size} ${HuamiBleProtocol.hex(chunk.copyOf(minOf(12, chunk.size)))}")
+                queueGattWrite(g, writeChar, chunk)
+            },
+            type = CHUNKED2021_ENDPOINT_AUTH,
+            data = sendPub,
+            extendedFlags = true,
+            encrypt = false
+        )
+
+        handler.postDelayed({
+            if (zeppAuthInProgress && authState != HuamiBleProtocol.AuthState.AUTHENTICATED) {
+                setStatus("Zepp OS auth: таймаут", error = true)
+                zeppAuthInProgress = false
+                finishLoadWithSummary(false, "Zepp ECDH auth timeout")
+            }
+        }, 15_000)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleChunked2021Notify(g: BluetoothGatt, value: ByteArray) {
+        val dec = chunkedDecoder ?: return
+        val needsAck = dec.decode(value)
+        if (needsAck) {
+            sendChunkedAck(g, dec.lastHandle, dec.lastCount)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun sendChunkedAck(g: BluetoothGatt, handle: Byte, count: Byte) {
+        val readChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_READ)
+            ?: return
+        // ACK is written TO the READ characteristic (as in Gadgetbridge)
+        queueGattWrite(g, readChar, byteArrayOf(0x04, 0x00, handle, 0x01, count))
+        Log.d(TAG, "chunked ACK queued handle=$handle count=$count")
+    }
+
+    /** Serialize GATT writes — Android allows only one outstanding write per connection. */
+    @SuppressLint("MissingPermission")
+    private fun queueGattWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+        gattWriteQueue.addLast(characteristic to value)
+        pumpGattWriteQueue(g)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun pumpGattWriteQueue(g: BluetoothGatt) {
+        if (gattWriteInFlight) return
+        val next = gattWriteQueue.removeFirstOrNull() ?: return
+        val (ch, value) = next
+        ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        ch.value = value
+        gattWriteInFlight = true
+        val ok = g.writeCharacteristic(ch)
+        Log.d(TAG, "GATT write ${ch.uuid.toString().take(8)}… len=${value.size} ok=$ok queueLeft=${gattWriteQueue.size}")
+        if (!ok) {
+            gattWriteInFlight = false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleZeppAuthPayload(g: BluetoothGatt, type: Short, payload: ByteArray) {
+        if (type != CHUNKED2021_ENDPOINT_AUTH) {
+            Log.d(TAG, "non-auth endpoint 0x${"%04x".format(type.toInt())} len=${payload.size}")
+            activityBytesReceived += payload.size
+            activityBuffer.add(payload)
+            return
+        }
+        if (payload.size < 3) return
+        val response = payload[0]
+        val step = payload[1]
+        val status = payload[2]
+        Log.i(TAG, "auth payload step=0x${"%02x".format(step)} status=0x${"%02x".format(status)} len=${payload.size}")
+
+        // RESPONSE=0x10, SUCCESS=0x01
+        if (response == 0x10.toByte() && step == 0x04.toByte() && status == 0x01.toByte() && payload.size >= 67) {
+            // remote random (16) + remote public (48)
+            val remoteRandom = payload.copyOfRange(3, 19)
+            val remotePublic = payload.copyOfRange(19, 67)
+            val priv = ecdhPrivate
+            val secretKey = authKeyBytes
+            if (priv == null || secretKey == null) {
+                finishLoadWithSummary(false, "ECDH state lost")
+                return
+            }
+            val sharedEc = ECDH_B163.ecdh_generate_shared(priv, remotePublic)
+            if (sharedEc == null || sharedEc.size < 24) {
+                finishLoadWithSummary(false, "ECDH shared secret failed")
+                return
+            }
+            val encryptedSequenceNumber =
+                (sharedEc[0].toInt() and 0xff) or
+                    ((sharedEc[1].toInt() and 0xff) shl 8) or
+                    ((sharedEc[2].toInt() and 0xff) shl 16) or
+                    ((sharedEc[3].toInt() and 0xff) shl 24)
+            val session = ByteArray(16)
+            for (i in 0 until 16) {
+                session[i] = (sharedEc[i + 8].toInt() xor secretKey[i].toInt()).toByte()
+            }
+            sessionAesKey = session
+            chunkedEncoder?.setEncryptionParameters(encryptedSequenceNumber, session)
+            chunkedDecoder?.setEncryptionParameters(session)
+            Log.i(TAG, "session key established seq=$encryptedSequenceNumber")
+
+            try {
+                val enc1 = Huami2021Crypto.encryptAesEcb(remoteRandom, secretKey)
+                val enc2 = Huami2021Crypto.encryptAesEcb(remoteRandom, session)
+                val command = ByteArray(33)
+                command[0] = 0x05
+                System.arraycopy(enc1, 0, command, 1, 16)
+                System.arraycopy(enc2, 0, command, 17, 16)
+                runOnUiThread { setStatus("Zepp OS auth: double-encrypted random…") }
+                val writeChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_WRITE)
+                    ?: return
+                chunkedEncoder?.write(
+                    chunkWriter = { chunk -> queueGattWrite(g, writeChar, chunk) },
+                    type = CHUNKED2021_ENDPOINT_AUTH,
+                    data = command,
+                    extendedFlags = true,
+                    encrypt = false
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "AES encrypt random", e)
+                finishLoadWithSummary(false, "AES encrypt failed: ${e.message}")
+            }
+        } else if (response == 0x10.toByte() && step == 0x05.toByte() && status == 0x01.toByte()) {
+            authState = HuamiBleProtocol.AuthState.AUTHENTICATED
+            zeppAuthInProgress = false
+            runOnUiThread { setStatus("Zepp OS auth: успех!", ok = true) }
+            Log.i(TAG, "Zepp OS ECDH auth SUCCESS")
+            // After auth: request activity if classic chars exist, else report ready for FT
+            handler.post {
+                if (HuamiBleProtocol.hasActivityChars(g)) {
+                    requestActivityData(g)
+                } else {
+                    finishLoadWithSummary(
+                        authenticated = true,
+                        note = "Zepp ECDH auth OK. Activity/GPS file transfer — следующий шаг (endpoint workouts)"
+                    )
+                }
+            }
+        } else if (response == 0x10.toByte() && step == 0x05.toByte() && status == 0x25.toByte()) {
+            zeppAuthInProgress = false
+            authState = HuamiBleProtocol.AuthState.FAILED
+            runOnUiThread { setStatus("Zepp OS auth: отказ (проверьте auth key)", error = true) }
+            finishLoadWithSummary(false, "Zepp AUTH_FAIL 0x25 — неверный ключ")
+        } else {
+            Log.w(TAG, "Unhandled auth payload: ${HuamiBleProtocol.hex(payload)}")
+        }
     }
 
     @SuppressLint("MissingPermission")
     private fun startClassicAuth(g: BluetoothGatt) {
         val authChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_AUTH)
         if (authChar == null) {
-            // No classic AUTH — try activity fetch anyway (some firmwares) or report Zepp path
             if (HuamiBleProtocol.hasZeppOsTransfer(g)) {
-                setStatus(
-                    "Classic AUTH нет — обнаружен Zepp OS transfer. " +
-                        "ECDH/chunked auth и GPS file transfer — следующий этап. " +
-                        "Сервисы готовы, ключ сохранён."
-                )
-                finishLoadWithSummary(
-                    authenticated = false,
-                    note = "Zepp OS: нужен ECDH (InitOperation2021), не classic AES"
-                )
+                startZeppOsAuth(g)
             } else {
-                setStatus("Нет AUTH characteristic — auth невозможен", error = true)
+                setStatus("Нет AUTH characteristic", error = true)
                 finishLoadWithSummary(false, "нет CHAR_AUTH")
             }
             return
@@ -810,7 +1012,6 @@ class WatchDirectActivity : Activity() {
             setStatus("Auth: writeCharacteristic failed", error = true)
             finishLoadWithSummary(false, "write AUTH failed")
         }
-        // Timeout
         handler.postDelayed({
             if (authState == HuamiBleProtocol.AuthState.WAITING_RANDOM ||
                 authState == HuamiBleProtocol.AuthState.WAITING_CONFIRM
@@ -907,7 +1108,13 @@ class WatchDirectActivity : Activity() {
     }
 
     private fun finishLoadWithSummary(authenticated: Boolean, note: String) {
+        if (finishPosted) {
+            Log.d(TAG, "finishLoad already shown, skip: $note")
+            return
+        }
+        finishPosted = true
         loadInProgress = false
+        zeppAuthInProgress = false
         loadTracksButton.isEnabled = true
         val g = gatt
         val zepp = g != null && HuamiBleProtocol.hasZeppOsTransfer(g)
@@ -1052,5 +1259,7 @@ class WatchDirectActivity : Activity() {
     companion object {
         private const val TAG = "WatchDirect"
         private const val REQ_BLE = 2001
+        /** Huami 2021 chunked endpoint for authentication (InitOperation2021). */
+        private const val CHUNKED2021_ENDPOINT_AUTH: Short = 0x0082
     }
 }

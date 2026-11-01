@@ -22,9 +22,9 @@ Android/Kotlin starter project for a standalone GPX exporter targeting Amazfit T
 4. **Ввести / получить Huami auth key** — для T-Rex 2 обычно нужен (кнопка из аккаунта Zepp или вручную).
 5. **Загрузить треки с часов**:
    - enable notifications (AUTH, ACTIVITY_DATA, chunked 2021 / Zepp FT при наличии);
-   - classic Huami AES-auth по auth key;
-   - запрос activity data за последние 7 дней и сбор сырых пакетов;
-   - на T-Rex 2 часто нужен ECDH (chunked 2021) + protobuf summary + file transfer GPS — это следующий этап (Gadgetbridge `InitOperation2021` / Zepp OS).
+   - **T-Rex 2 / Zepp OS**: ECDH B-163 auth через chunked 2021 (endpoint `0x0082`), как в Gadgetbridge `InitOperation2021`;
+   - classic Huami AES-auth — для устройств с CHAR_AUTH;
+   - после auth — запрос activity data (если есть) и статус готовности к file transfer GPS.
 
 Загрузка треков **из облака** уже реализована; эта страница — прямой BLE.
 
