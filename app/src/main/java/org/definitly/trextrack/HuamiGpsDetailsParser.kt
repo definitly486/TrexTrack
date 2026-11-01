@@ -22,116 +22,86 @@ object HuamiGpsDetailsParser {
     private const val TYPE_GPS_COORDS = 2
     private const val TYPE_GPS_DELTA = 3
 
-    fun parse(raw: ByteArray): List<GpsPoint> {
+    /**
+     * Zepp OS details are a sequence of one-byte type + one-byte payload length
+     * records. GPS_DELTA carries a millisecond time offset followed by longitude
+     * and latitude deltas. The point must be emitted AFTER applying that record.
+     */
+    fun parse(raw: ByteArray, workoutStartTimeMs: Long = 0L): List<GpsPoint> {
         if (raw.isEmpty()) return emptyList()
         val buf = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
         val points = mutableListOf<GpsPoint>()
-        var timestamp = 0L
-        var offset = 0
+        var timestamp = workoutStartTimeMs
+        var offset = 0L
         var lon = 0
         var lat = 0
         var hasCoords = false
 
         fun emit() {
             if (!hasCoords) return
-            points.add(
-                GpsPoint(
-                    timeMs = timestamp + offset,
-                    latitude = lat / DIV,
-                    longitude = lon / DIV
-                )
-            )
+            val latitude = lat / DIV
+            val longitude = lon / DIV
+            if (latitude !in -90.0..90.0 || longitude !in -180.0..180.0) {
+                Log.w(TAG, "ignoring out-of-range GPS coordinate $latitude,$longitude")
+                return
+            }
+            val previous = points.lastOrNull()
+            if (previous != null &&
+                previous.latitude == latitude &&
+                previous.longitude == longitude &&
+                previous.timeMs == timestamp + offset
+            ) return
+            points.add(GpsPoint(timestamp + offset, latitude, longitude))
         }
 
-        while (buf.remaining() > 2) {
-            val typeCode = try {
-                consumeTag(buf)
-            } catch (_: Exception) {
+        while (buf.remaining() >= 2) {
+            val typeCode = buf.get().toInt() and 0xff
+            val length = buf.get().toInt() and 0xff
+            if (length > buf.remaining()) {
+                Log.w(TAG, "truncated details record type=$typeCode length=$length remaining=${buf.remaining()}")
                 break
             }
-            val length = try {
-                consumeLength(buf)
-            } catch (_: Exception) {
-                break
-            }
-            if (length < 0 || length > buf.remaining()) break
             val start = buf.position()
+            val end = start + length
             try {
                 when (typeCode) {
-                    TYPE_TIMESTAMP -> {
-                        if (length >= 12) {
-                            emit()
-                            buf.int // unknown
-                            timestamp = buf.long
-                            offset = 0
-                        } else {
-                            buf.position(start + length)
-                        }
+                    TYPE_TIMESTAMP -> if (length == 12) {
+                        buf.int // reserved
+                        timestamp = buf.long
+                        offset = 0L
                     }
-                    TYPE_GPS_COORDS -> {
-                        if (length >= 14) {
-                            buf.position(buf.position() + 6)
-                            lon = buf.int
-                            lat = buf.int
-                            hasCoords = true
-                            // skip rest of record
-                            buf.position(start + length)
-                        } else {
-                            buf.position(start + length)
-                        }
+                    TYPE_GPS_COORDS -> if (length == 20) {
+                        buf.position(buf.position() + 6)
+                        lon = buf.int
+                        lat = buf.int
+                        buf.position(end) // trailing reserved bytes
+                        hasCoords = true
+                        emit()
                     }
-                    TYPE_GPS_DELTA -> {
-                        if (length >= 8) {
-                            emit()
-                            offset = buf.short.toInt()
-                            val lonD = buf.short.toInt()
-                            val latD = buf.short.toInt()
-                            buf.short // always 2?
-                            if (hasCoords) {
-                                lon += lonD
-                                lat += latD
-                            }
-                            buf.position(start + length)
-                        } else {
-                            buf.position(start + length)
-                        }
+                    TYPE_GPS_DELTA -> if (length == 8) {
+                        offset = buf.short.toLong()
+                        lon += buf.short.toInt()
+                        lat += buf.short.toInt()
+                        buf.short // reserved (usually 2)
+                        if (hasCoords) emit()
                     }
-                    else -> buf.position(start + length)
+                    // STATUS, SPEED, ALTITUDE, HEART RATE and unknown records are
+                    // currently not represented in GpsPoint, but are safely skipped.
+                    else -> Unit
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "parse error at ${buf.position()}: ${e.message}")
+                Log.w(TAG, "parse error at $start for type=$typeCode: ${e.message}")
                 break
             }
-            // ensure we advanced
-            if (buf.position() < start + length) {
-                buf.position(start + length)
+            if (buf.position() < end) buf.position(end)
+            if (buf.position() > end) {
+                Log.w(TAG, "record type=$typeCode over-read payload: end=$end pos=${buf.position()}")
+                break
             }
         }
-        emit()
+
         Log.i(TAG, "parsed ${points.size} GPS points from ${raw.size} bytes")
         return points
-    }
-
-    private fun consumeTag(buf: ByteBuffer): Int {
-        val first = buf.get().toInt() and 0xff
-        if ((first and 0x1f) != 0x1f) return first
-        var tag = first
-        while (buf.hasRemaining()) {
-            val b = buf.get().toInt() and 0xff
-            tag = (tag shl 8) or b
-            if ((b and 0x80) == 0) break
-        }
-        return tag
-    }
-
-    private fun consumeLength(buf: ByteBuffer): Int {
-        val first = buf.get().toInt() and 0xff
-        if ((first and 0x80) == 0) return first
-        val n = first and 0x7f
-        if (n == 0 || n > 4) throw IllegalStateException("bad length $n")
-        var v = 0
-        repeat(n) { v = (v shl 8) or (buf.get().toInt() and 0xff) }
-        return v
     }
 
     fun toGpx(points: List<GpsPoint>, name: String = "T-Rex track"): String {
