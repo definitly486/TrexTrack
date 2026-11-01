@@ -1485,7 +1485,10 @@ class WatchDirectActivity : Activity() {
         val hour = payload[offset + 4].toInt() and 0xff
         val min = payload[offset + 5].toInt() and 0xff
         val sec = if (payload.size > offset + 6) payload[offset + 6].toInt() and 0xff else 0
-        return java.util.Calendar.getInstance().apply {
+        // Huami's START_DATE response carries its own timezone in byte 14.
+        // Gadgetbridge's rawBytesToCalendar() uses a fixed-offset timezone;
+        // for this watch the returned offset is UTC (0), not the phone timezone.
+        return java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
             set(java.util.Calendar.YEAR, year)
             set(java.util.Calendar.MONTH, month - 1)
             set(java.util.Calendar.DAY_OF_MONTH, day)
@@ -1508,23 +1511,21 @@ class WatchDirectActivity : Activity() {
         sportsFetchType = 0x06
         finishPosted = false
 
-        // Match Gadgetbridge's FetchSportsDetailsOperation: it takes the summary's
-        // Unix start time, creates a device-local Calendar, then HuamiSupport.getTimeBytes()
-        // serializes year/month/day/hour/minute plus reason=0 and the local TZ quarter-hours.
-        // The START_DATE response's final two bytes are not a ready-to-send request tail:
-        // its timestamp is UTC, while the details request must use the local Calendar.
+        // Match Gadgetbridge's FetchSportsDetailsOperation: its summary start time
+        // originates from HuamiSupport.fromTimeBytes(), which preserves the watch's
+        // fixed timezone offset. Do not rebuild this date in the phone's timezone.
         val summaryEpoch = lastParsedSummary?.startTimestampSec
-        val requestCalendar = summaryEpoch?.let { sec ->
-            java.util.Calendar.getInstance().apply {
+        val requestCalendar = sportsSinceCal ?: summaryEpoch?.let { sec ->
+            java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
                 timeInMillis = sec * 1000L
             }
-        } ?: sportsSinceCal ?: java.util.Calendar.getInstance().apply {
+        } ?: java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
             add(java.util.Calendar.DAY_OF_YEAR, -30)
         }
         val timeBytes = huamiTimeBytes(requestCalendar)
         Log.i(
             TAG,
-            "details date source=${if (summaryEpoch != null) "summary-local-calendar" else "fallback-calendar"} " +
+            "details date source=${if (sportsSinceCal != null) "watch-fixed-offset-calendar" else if (summaryEpoch != null) "summary-utc-fallback" else "fallback-calendar"} " +
                 "summaryEpoch=$summaryEpoch watchBytes=${sportsSinceTimeBytes?.let { HuamiBleProtocol.hex(it) }} " +
                 "requestBytes=${HuamiBleProtocol.hex(timeBytes)} " +
                 "calendar=${requestCalendar.time} tz=${requestCalendar.timeZone.id}"
