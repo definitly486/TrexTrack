@@ -454,8 +454,26 @@ class WatchDirectActivity : Activity() {
             return
         }
         stopScan()
-        setStatus("Подключение к ${device.name ?: device.address}…")
         connectButton.isEnabled = false
+
+        // Сразу подтянуть auth key (по MAC выбранных часов), затем GATT-подключение
+        setStatus("Auth key + подключение к ${device.name ?: device.address}…")
+        scope.launch {
+            try {
+                ensureAuthKeyForDevice(device.address)
+            } catch (t: Throwable) {
+                Log.w(TAG, "ensureAuthKeyForDevice", t)
+                // Не блокируем BLE-подключение, если облако недоступно
+            }
+            runOnUiThread {
+                doGattConnect(device)
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun doGattConnect(device: BluetoothDevice) {
+        setStatus("Подключение к ${device.name ?: device.address}…")
         try {
             gatt?.close()
             gatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
@@ -464,6 +482,50 @@ class WatchDirectActivity : Activity() {
             setStatus("Ошибка connectGatt: ${e.message}", error = true)
             connectButton.isEnabled = true
         }
+    }
+
+    /**
+     * Получить и сохранить auth key для [mac].
+     * Если уже есть ключ для этого MAC — не ходим в облако.
+     * При нескольких устройствах в аккаунте предпочитает совпадение MAC.
+     */
+    private suspend fun ensureAuthKeyForDevice(mac: String) {
+        val norm = mac.replace(":", "").lowercase()
+        val existing = sessionStore.getAuthKey()
+        val existingMac = sessionStore.getAuthKeyMac()?.replace(":", "")?.lowercase()
+        if (!existing.isNullOrBlank() && existingMac != null && existingMac == norm) {
+            authKeyHex = existing
+            Log.i(TAG, "auth key already present for $mac")
+            runOnUiThread { refreshKeyStatus() }
+            return
+        }
+        if (!sessionStore.isLoggedIn()) {
+            Log.i(TAG, "skip cloud auth key: not logged in")
+            runOnUiThread {
+                if (authKeyHex.isNullOrBlank() && sessionStore.getAuthKey().isNullOrBlank()) {
+                    Toast.makeText(
+                        this@WatchDirectActivity,
+                        "Нет auth key: войдите в Zepp на экране «Облако» или введите ключ вручную",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+            return
+        }
+        runOnUiThread { setStatus("Загрузка auth key из Zepp…") }
+        val devices = withContext(Dispatchers.IO) {
+            repository.listBoundDevices()
+        }
+        val withKey = devices.filter { it.authKeyHex.isNotBlank() }
+        if (withKey.isEmpty()) {
+            Log.w(TAG, "cloud devices without auth_key: ${devices.size}")
+            return
+        }
+        val match = withKey.firstOrNull {
+            it.macAddress.replace(":", "").lowercase() == norm
+        } ?: withKey.firstOrNull { it.active } ?: withKey.first()
+        runOnUiThread { applyAuthKey(match) }
+        Log.i(TAG, "auth key auto-fetched mac=${match.macAddress} for selected=$mac")
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
