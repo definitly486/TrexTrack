@@ -123,6 +123,8 @@ class WatchDirectActivity : Activity() {
     /** 0x05 summaries, 0x06 details */
     private var sportsFetchType: Byte = 0x05
     private var sportsSinceCal: java.util.Calendar? = null
+    /** Exact timestamp bytes returned by the watch (year..second, timezone). */
+    private var sportsSinceTimeBytes: ByteArray? = null
     private var lastParsedSummary: ParsedWorkoutSummary? = null
     private var lastGpsPoints: List<GpsPoint> = emptyList()
 
@@ -1264,8 +1266,17 @@ class WatchDirectActivity : Activity() {
                 } else 0
                 // date starts at offset 7
                 if (payload.size >= 15) {
+                    // The watch returns its own timestamp in bytes 7..14:
+                    // uint16 year, month, day, hour, minute, second, timezone.
+                    // Keep these bytes: rebuilding them from a Unix timestamp in the
+                    // phone timezone shifts the wall clock (T-Rex 2 reports UTC here).
+                    sportsSinceTimeBytes = payload.copyOfRange(7, 15)
                     sportsSinceCal = calendarFromHuamiBytes(payload, 7)
-                    Log.i(TAG, "sports since from watch: ${sportsSinceCal?.time}")
+                    Log.i(
+                        TAG,
+                        "sports since from watch: ${sportsSinceCal?.time} " +
+                            "raw=${HuamiBleProtocol.hex(sportsSinceTimeBytes!!)}"
+                    )
                 }
                 Log.i(TAG, "sports expectedDataLength=$expected type=0x${"%02x".format(sportsFetchType)}")
                 expectedSportsBytes = expected
@@ -1345,6 +1356,8 @@ class WatchDirectActivity : Activity() {
         sportsFetchType = 0x05
         lastParsedSummary = null
         lastGpsPoints = emptyList()
+        sportsSinceTimeBytes = null
+        sportsSinceCal = null
 
         val since = java.util.Calendar.getInstance().apply {
             add(java.util.Calendar.DAY_OF_YEAR, -30)
@@ -1493,23 +1506,32 @@ class WatchDirectActivity : Activity() {
         sportsFetchType = 0x06
         finishPosted = false
 
-        // The metadata response contains a pagination cursor, not necessarily the
-        // workout's start time. Prefer the timestamp inside WorkoutSummary; using the
-        // cursor here can shift the details request away from the selected workout.
+        // Gadgetbridge uses the timestamp returned by the watch's START_DATE
+        // response as the start time for the details operation. Preserve the
+        // watch-provided timezone instead of converting the protobuf epoch through
+        // the phone timezone (which shifted 01:46 to 04:46 on this T-Rex 2).
         val summaryEpoch = lastParsedSummary?.startTimestampSec
-        val cursorEpoch = sportsSinceCal?.timeInMillis?.div(1000L)
-        val since = summaryEpoch?.let { sec ->
-            java.util.Calendar.getInstance().apply { timeInMillis = sec * 1000L }
-        } ?: sportsSinceCal ?: java.util.Calendar.getInstance().apply {
-            add(java.util.Calendar.DAY_OF_YEAR, -30)
+        val watchTimeBytes = sportsSinceTimeBytes?.copyOf()
+        val timeBytes = if (watchTimeBytes != null && watchTimeBytes.size >= 8) {
+            watchTimeBytes.copyOfRange(0, 8).also {
+                it[6] = 0 // Gadgetbridge fetches sports details with minute precision.
+            }
+        } else {
+            val fallback = summaryEpoch?.let { sec ->
+                java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
+                    timeInMillis = sec * 1000L
+                }
+            } ?: sportsSinceCal ?: java.util.Calendar.getInstance().apply {
+                add(java.util.Calendar.DAY_OF_YEAR, -30)
+            }
+            huamiTimeBytes(fallback)
         }
         Log.i(
             TAG,
-            "details date source=${if (summaryEpoch != null) "summary" else "cursor/fallback"} " +
-                "summaryEpoch=$summaryEpoch cursorEpoch=$cursorEpoch deltaSec=${if (summaryEpoch != null && cursorEpoch != null) summaryEpoch - cursorEpoch else "n/a"}"
+            "details date source=${if (watchTimeBytes != null) "watch-response" else "fallback"} " +
+                "summaryEpoch=$summaryEpoch watchBytes=${watchTimeBytes?.let { HuamiBleProtocol.hex(it) }} " +
+                "requestBytes=${HuamiBleProtocol.hex(timeBytes)}"
         )
-
-        val timeBytes = huamiTimeBytes(since)
         val cmd = ByteArray(2 + timeBytes.size)
         cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
         cmd[1] = 0x06 // SPORTS_DETAILS
