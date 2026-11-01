@@ -122,6 +122,8 @@ class WatchDirectActivity : Activity() {
     private val sportsDataBuffer = java.io.ByteArrayOutputStream()
     /** 0x05 summaries, 0x06 details */
     private var sportsFetchType: Byte = 0x05
+    /** FETCH_DATA completion metadata must arrive before ACK / next fetch. */
+    private var sportsFetchMetaComplete = false
     private var sportsSinceCal: java.util.Calendar? = null
     /** Exact timestamp bytes returned by the watch (year..second, timezone). */
     private var sportsSinceTimeBytes: ByteArray? = null
@@ -1300,8 +1302,17 @@ class WatchDirectActivity : Activity() {
                 Log.i(TAG, "FETCH_DATA meta status=${payload[2]}")
                 if (payload[2] != HuamiBleProtocol.AUTH_SUCCESS) {
                     finishLoadWithSummary(true, "FETCH_DATA fail status=${payload[2]}")
+                    return
                 }
-                // data packets arrive on ACTIVITY_DATA characteristic
+                // Gadgetbridge waits for this completion response before ACKing the
+                // received activity bytes. The watch may send the final data packet
+                // a few milliseconds before this metadata notification.
+                sportsFetchMetaComplete = true
+                val received = sportsDataBuffer.size()
+                Log.i(TAG, "FETCH_DATA complete meta received=$received expected=$expectedSportsBytes")
+                if (sportsFetchActive && expectedSportsBytes > 0 && received >= expectedSportsBytes) {
+                    finishSportsFetch("complete-meta")
+                }
             }
             HuamiBleProtocol.CMD_ACK_ACTIVITY -> {
                 // This is the watch's reply to our ACK, not a request to finish
@@ -1354,6 +1365,7 @@ class WatchDirectActivity : Activity() {
         sportsFetchActive = false
         expectedSportsBytes = -1
         sportsFetchType = 0x05
+        sportsFetchMetaComplete = false
         lastParsedSummary = null
         lastGpsPoints = emptyList()
         sportsSinceTimeBytes = null
@@ -1509,6 +1521,7 @@ class WatchDirectActivity : Activity() {
         sportsFetchActive = false
         expectedSportsBytes = -1
         sportsFetchType = 0x06
+        sportsFetchMetaComplete = false
         finishPosted = false
 
         // Match Gadgetbridge's FetchSportsDetailsOperation: its summary start time
@@ -1670,7 +1683,11 @@ class WatchDirectActivity : Activity() {
                     setStatus("Sports data: $got / $expectedSportsBytes байт")
                 }
                 if (expectedSportsBytes > 0 && got >= expectedSportsBytes) {
-                    finishSportsFetch("complete")
+                    if (sportsFetchMetaComplete) {
+                        finishSportsFetch("complete-data+meta")
+                    } else {
+                        Log.i(TAG, "sports data complete; waiting for FETCH_DATA metadata before ACK")
+                    }
                 }
             } else {
                 Log.w(TAG, "sports packet counter gap: got=$counter last=$sportsPacketCounter")
