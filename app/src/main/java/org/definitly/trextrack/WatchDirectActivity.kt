@@ -1281,7 +1281,7 @@ class WatchDirectActivity : Activity() {
                 Log.i(TAG, "sports expectedDataLength=$expected type=0x${"%02x".format(sportsFetchType)}")
                 expectedSportsBytes = expected
                 if (expected == 0) {
-                    writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY))
+                    writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY, 0x09))
                     if (sportsFetchType == 0x05.toByte()) {
                         finishLoadWithSummary(true, "Нет sports summary с указанной даты (0 байт)")
                     } else {
@@ -1426,7 +1426,9 @@ class WatchDirectActivity : Activity() {
 
         gatt?.let { g ->
             if (raw.isNotEmpty()) {
-                writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY))
+                // Zepp OS ACK: 0x09 confirms receipt but keeps the workout on the watch.
+                // A one-byte/0x01 ACK can discard GPS details before the 0x06 request.
+                writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY, 0x09))
             }
         }
 
