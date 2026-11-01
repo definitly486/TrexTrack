@@ -1137,7 +1137,7 @@ class WatchDirectActivity : Activity() {
         when (type) {
             CHUNKED2021_ENDPOINT_AUTH -> handleAuthEndpoint(g, payload)
             CHUNKED2021_ENDPOINT_HTTP -> handleHttpEndpoint(g, payload)
-            CHUNKED2021_ENDPOINT_ACTIVITY -> handleActivityControlEndpoint(g, payload)
+            CHUNKED2021_ENDPOINT_ACTIVITY -> Log.d(TAG, "ignore chunked activity endpoint for workout fetch; T-Rex 2 uses ACTIVITY_CONTROL/ACTIVITY_DATA")
             CHUNKED2021_ENDPOINT_SERVICES -> handleServicesEndpoint(g, payload)
             CHUNKED2021_ENDPOINT_CONNECTION -> handleConnectionEndpoint(g, payload)
             else -> {
@@ -1195,15 +1195,13 @@ class WatchDirectActivity : Activity() {
                 activityEndpointEncrypted = encFlag != 0
             }
         }
-        val hasActivity = supportedEndpoints.contains(CHUNKED2021_ENDPOINT_ACTIVITY)
-        useChunkedActivityFetch = hasActivity
-        Log.i(TAG, "has activity 0x004b=$hasActivity encrypted=$activityEndpointEncrypted useChunked=$useChunkedActivityFetch")
-        runOnUiThread {
-            setStatus(
-                if (hasActivity) "Сервисы: $num, sports via 0x004b…"
-                else "Сервисы: $num, sports via classic ACT_CTL…"
-            )
-        }
+        // Gadgetbridge's T-Rex 2 implementation fetches workout summaries/details
+        // through the legacy ACTIVITY_CONTROL and ACTIVITY_DATA GATT characteristics.
+        // ECDH/chunked transport remains in use for authentication and other services.
+        // Do not route workout fetch through the unverified 0x004b endpoint.
+        useChunkedActivityFetch = false
+        Log.i(TAG, "sports fetch transport=classic ACTIVITY_CONTROL/ACTIVITY_DATA")
+        runOnUiThread { setStatus("Сервисы: $num, sports via classic ACT_CTL…") }
         requestSportsSummaries(g)
     }
 
@@ -1409,7 +1407,8 @@ class WatchDirectActivity : Activity() {
     }
 
     /**
-     * Request sports summaries (type 0x05) since 30 days ago via Zepp OS endpoint 0x004b.
+     * Request sports summaries (type 0x05) via the ACTIVITY_CONTROL /
+     * ACTIVITY_DATA flow used by Gadgetbridge for Amazfit T-Rex 2.
      */
     @SuppressLint("MissingPermission")
     private fun requestSportsSummaries(g: BluetoothGatt) {
@@ -1440,7 +1439,7 @@ class WatchDirectActivity : Activity() {
         Log.i(
             TAG,
             "request sports summaries cmd=${HuamiBleProtocol.hex(cmd)} " +
-                "via=${if (useChunkedActivityFetch) "0x004b" else "classic"} enc=$activityEndpointEncrypted"
+                "via=classic ACTIVITY_CONTROL"
         )
         runOnUiThread { setStatus("Запрос sports summaries (30 дней)…") }
         writeActivityControl(g, cmd)
@@ -1455,10 +1454,9 @@ class WatchDirectActivity : Activity() {
     /** Write activity/sports control either via 0x004b or classic characteristic. */
     @SuppressLint("MissingPermission")
     private fun writeActivityControl(g: BluetoothGatt, data: ByteArray) {
-        if (useChunkedActivityFetch) {
-            writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, data, encrypt = activityEndpointEncrypted)
-            return
-        }
+        // T-Rex 2 workout sync in Gadgetbridge uses the classic Huami activity
+        // characteristics. ECDH authentication is still performed above, but
+        // workout commands are sent here, not through endpoint 0x004b.
         val control = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_ACTIVITY_CONTROL)
         if (control == null) {
             Log.e(TAG, "no CHAR_ACTIVITY_CONTROL")
