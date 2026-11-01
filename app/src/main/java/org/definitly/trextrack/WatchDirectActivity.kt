@@ -109,6 +109,12 @@ class WatchDirectActivity : Activity() {
     private var gattWriteInFlight = false
     private var negotiatedMtu: Int = 23
 
+    // Sports summary fetch (endpoint 0x004b)
+    private var sportsFetchActive = false
+    private var expectedSportsBytes = -1
+    private var sportsPacketCounter: Byte = -1
+    private val sportsDataBuffer = java.io.ByteArrayOutputStream()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -947,12 +953,21 @@ class WatchDirectActivity : Activity() {
 
     @SuppressLint("MissingPermission")
     private fun handleZeppAuthPayload(g: BluetoothGatt, type: Short, payload: ByteArray) {
-        if (type != CHUNKED2021_ENDPOINT_AUTH) {
-            Log.d(TAG, "non-auth endpoint 0x${"%04x".format(type.toInt())} len=${payload.size}")
-            activityBytesReceived += payload.size
-            activityBuffer.add(payload)
-            return
+        when (type) {
+            CHUNKED2021_ENDPOINT_AUTH -> handleAuthEndpoint(g, payload)
+            CHUNKED2021_ENDPOINT_HTTP -> handleHttpEndpoint(g, payload)
+            CHUNKED2021_ENDPOINT_ACTIVITY -> handleActivityControlEndpoint(g, payload)
+            else -> {
+                Log.d(TAG, "endpoint 0x${"%04x".format(type.toInt())} len=${payload.size} " +
+                    HuamiBleProtocol.hex(payload.copyOf(minOf(24, payload.size))))
+                activityBytesReceived += payload.size
+                activityBuffer.add(payload.copyOf())
+            }
         }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleAuthEndpoint(g: BluetoothGatt, payload: ByteArray) {
         if (payload.size < 3) return
         val response = payload[0]
         val step = payload[1]
@@ -961,7 +976,6 @@ class WatchDirectActivity : Activity() {
 
         // RESPONSE=0x10, SUCCESS=0x01
         if (response == 0x10.toByte() && step == 0x04.toByte() && status == 0x01.toByte() && payload.size >= 67) {
-            // remote random (16) + remote public (48)
             val remoteRandom = payload.copyOfRange(3, 19)
             val remotePublic = payload.copyOfRange(19, 67)
             val priv = ecdhPrivate
@@ -997,15 +1011,7 @@ class WatchDirectActivity : Activity() {
                 System.arraycopy(enc1, 0, command, 1, 16)
                 System.arraycopy(enc2, 0, command, 17, 16)
                 runOnUiThread { setStatus("Zepp OS auth: double-encrypted random…") }
-                val writeChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_WRITE)
-                    ?: return
-                chunkedEncoder?.write(
-                    chunkWriter = { chunk -> queueGattWrite(g, writeChar, chunk) },
-                    type = CHUNKED2021_ENDPOINT_AUTH,
-                    data = command,
-                    extendedFlags = true,
-                    encrypt = false
-                )
+                writeChunked(g, CHUNKED2021_ENDPOINT_AUTH, command, encrypt = false)
             } catch (e: Exception) {
                 Log.e(TAG, "AES encrypt random", e)
                 finishLoadWithSummary(false, "AES encrypt failed: ${e.message}")
@@ -1013,19 +1019,9 @@ class WatchDirectActivity : Activity() {
         } else if (response == 0x10.toByte() && step == 0x05.toByte() && status == 0x01.toByte()) {
             authState = HuamiBleProtocol.AuthState.AUTHENTICATED
             zeppAuthInProgress = false
-            runOnUiThread { setStatus("Zepp OS auth: успех!", ok = true) }
+            runOnUiThread { setStatus("Zepp OS auth: успех! Запрос sports…", ok = true) }
             Log.i(TAG, "Zepp OS ECDH auth SUCCESS")
-            // After auth: request activity if classic chars exist, else report ready for FT
-            handler.post {
-                if (HuamiBleProtocol.hasActivityChars(g)) {
-                    requestActivityData(g)
-                } else {
-                    finishLoadWithSummary(
-                        authenticated = true,
-                        note = "Zepp ECDH auth OK. Activity/GPS file transfer — следующий шаг (endpoint workouts)"
-                    )
-                }
-            }
+            handler.post { requestSportsSummaries(g) }
         } else if (response == 0x10.toByte() && step == 0x05.toByte() && status == 0x25.toByte()) {
             zeppAuthInProgress = false
             authState = HuamiBleProtocol.AuthState.FAILED
@@ -1034,6 +1030,158 @@ class WatchDirectActivity : Activity() {
         } else {
             Log.w(TAG, "Unhandled auth payload: ${HuamiBleProtocol.hex(payload)}")
         }
+    }
+
+    /**
+     * Endpoint 0x0001 — watch asks phone to HTTP GET Huami APIs.
+     * Reply "no internet" so the watch does not wait.
+     */
+    @SuppressLint("MissingPermission")
+    private fun handleHttpEndpoint(g: BluetoothGatt, payload: ByteArray) {
+        if (payload.isEmpty()) return
+        Log.i(TAG, "HTTP endpoint cmd=0x${"%02x".format(payload[0])} len=${payload.size}")
+        if (payload[0] == 0x01.toByte() && payload.size >= 2) {
+            // CMD_SIMPLE_REQUEST: requestId at [1]
+            val requestId = payload[1].toInt() and 0xff
+            // CMD_SIMPLE_RESPONSE, requestId, RESPONSE_NO_INTERNET=0x02, 4 zero bytes
+            val reply = byteArrayOf(0x02, requestId.toByte(), 0x02, 0, 0, 0, 0)
+            Log.i(TAG, "HTTP reply no-internet id=$requestId")
+            writeChunked(g, CHUNKED2021_ENDPOINT_HTTP, reply, encrypt = true)
+        } else if (payload[0] == 0x03.toByte() && payload.size >= 2) {
+            val requestId = payload[1].toInt() and 0xff
+            // raw download — also refuse
+            val reply = byteArrayOf(0x02, requestId.toByte(), 0x02, 0, 0, 0, 0)
+            writeChunked(g, CHUNKED2021_ENDPOINT_HTTP, reply, encrypt = true)
+        }
+    }
+
+    /**
+     * Endpoint 0x004b — activity/sports fetch control metadata (same opcodes as classic).
+     */
+    @SuppressLint("MissingPermission")
+    private fun handleActivityControlEndpoint(g: BluetoothGatt, payload: ByteArray) {
+        Log.i(TAG, "activity control meta: ${HuamiBleProtocol.hex(payload)}")
+        if (payload.size < 3) return
+        if (payload[0] != 0x10.toByte()) {
+            Log.w(TAG, "activity meta not RESPONSE")
+            return
+        }
+        when (payload[1]) {
+            HuamiBleProtocol.CMD_ACTIVITY_START_DATE -> {
+                if (payload[2] != HuamiBleProtocol.AUTH_SUCCESS) {
+                    Log.w(TAG, "start-date unsuccessful")
+                    finishLoadWithSummary(true, "sports start-date fail status=${payload[2]}")
+                    return
+                }
+                val expected = if (payload.size >= 7) {
+                    (payload[3].toInt() and 0xff) or
+                        ((payload[4].toInt() and 0xff) shl 8) or
+                        ((payload[5].toInt() and 0xff) shl 16) or
+                        ((payload[6].toInt() and 0xff) shl 24)
+                } else 0
+                Log.i(TAG, "sports expectedDataLength=$expected")
+                expectedSportsBytes = expected
+                if (expected == 0) {
+                    // ACK and finish — no workouts
+                    writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY), encrypt = true)
+                    finishLoadWithSummary(true, "Нет sports summary с указанной даты (0 байт)")
+                } else {
+                    runOnUiThread { setStatus("Sports: ждут $expected байт, FETCH_DATA…") }
+                    sportsFetchActive = true
+                    writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_FETCH_DATA), encrypt = true)
+                }
+            }
+            HuamiBleProtocol.CMD_FETCH_DATA -> {
+                Log.i(TAG, "FETCH_DATA meta status=${payload[2]}")
+                if (payload[2] != HuamiBleProtocol.AUTH_SUCCESS) {
+                    finishLoadWithSummary(true, "FETCH_DATA fail status=${payload[2]}")
+                }
+                // data packets arrive on ACTIVITY_DATA characteristic
+            }
+            HuamiBleProtocol.CMD_ACK_ACTIVITY -> {
+                Log.i(TAG, "ACK meta")
+                finishSportsFetch("ACK")
+            }
+            else -> Log.w(TAG, "unknown activity meta cmd=0x${"%02x".format(payload[1])}")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeChunked(g: BluetoothGatt, endpoint: Short, data: ByteArray, encrypt: Boolean) {
+        val writeChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_WRITE)
+            ?: return
+        chunkedEncoder?.write(
+            chunkWriter = { chunk -> queueGattWrite(g, writeChar, chunk) },
+            type = endpoint,
+            data = data,
+            extendedFlags = true,
+            encrypt = encrypt
+        )
+    }
+
+    /**
+     * Request sports summaries (type 0x05) since 30 days ago via Zepp OS endpoint 0x004b.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestSportsSummaries(g: BluetoothGatt) {
+        activityBuffer.clear()
+        activityBytesReceived = 0
+        sportsDataBuffer.reset()
+        sportsPacketCounter = (-1).toByte()
+        sportsFetchActive = false
+        expectedSportsBytes = -1
+
+        val since = java.util.Calendar.getInstance().apply {
+            add(java.util.Calendar.DAY_OF_YEAR, -30)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+        val timeBytes = huamiTimeBytes(since)
+        // 0x01 = START_DATE, 0x05 = SPORTS_SUMMARIES
+        val cmd = ByteArray(2 + timeBytes.size)
+        cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
+        cmd[1] = 0x05 // SPORTS_SUMMARIES
+        System.arraycopy(timeBytes, 0, cmd, 2, timeBytes.size)
+        Log.i(TAG, "request sports summaries cmd=${HuamiBleProtocol.hex(cmd)}")
+        runOnUiThread { setStatus("Запрос sports summaries (30 дней)…") }
+        writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, cmd, encrypt = true)
+
+        handler.postDelayed({
+            if (loadInProgress && !finishPosted) {
+                finishSportsFetch("timeout")
+            }
+        }, 20_000)
+    }
+
+    /** year_lo, year_hi, month, day, hour, minute, seconds(0), tz */
+    private fun huamiTimeBytes(cal: java.util.Calendar): ByteArray {
+        val year = cal.get(java.util.Calendar.YEAR)
+        val tzQuarter = (cal.timeZone.getOffset(cal.timeInMillis) / (1000 * 60 * 15)).toByte()
+        return byteArrayOf(
+            (year and 0xff).toByte(),
+            ((year shr 8) and 0xff).toByte(),
+            (cal.get(java.util.Calendar.MONTH) + 1).toByte(),
+            cal.get(java.util.Calendar.DAY_OF_MONTH).toByte(),
+            cal.get(java.util.Calendar.HOUR_OF_DAY).toByte(),
+            cal.get(java.util.Calendar.MINUTE).toByte(),
+            0, // seconds truncated
+            tzQuarter
+        )
+    }
+
+    private fun finishSportsFetch(reason: String) {
+        sportsFetchActive = false
+        val raw = sportsDataBuffer.toByteArray()
+        val head = HuamiBleProtocol.hex(raw.copyOf(minOf(32, raw.size)))
+        val note = "sports fetch ($reason): buffer=${raw.size} bytes, expected=$expectedSportsBytes, head=$head"
+        Log.i(TAG, note)
+        // ACK if we got something
+        gatt?.let { g ->
+            if (raw.isNotEmpty()) {
+                writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY), encrypt = true)
+            }
+        }
+        finishLoadWithSummary(true, note)
     }
 
     @SuppressLint("MissingPermission")
@@ -1146,10 +1294,32 @@ class WatchDirectActivity : Activity() {
     private fun handleActivityData(value: ByteArray) {
         activityBytesReceived += value.size
         activityBuffer.add(value.copyOf())
-        Log.d(TAG, "activity chunk #${activityBuffer.size} len=${value.size} " +
-            "head=${HuamiBleProtocol.hex(value.copyOf(minOf(8, value.size)))}")
-        runOnUiThread {
-            setStatus("Activity данные: ${activityBuffer.size} пак. / $activityBytesReceived байт")
+        Log.d(TAG, "activity data len=${value.size} " +
+            "head=${HuamiBleProtocol.hex(value.copyOf(minOf(12, value.size)))}")
+
+        if (sportsFetchActive && value.isNotEmpty()) {
+            val counter = value[0]
+            if (sportsPacketCounter.toInt() == -1 || (sportsPacketCounter + 1).toByte() == counter) {
+                sportsPacketCounter = counter
+                if (value.size > 1) {
+                    sportsDataBuffer.write(value, 1, value.size - 1)
+                }
+                val got = sportsDataBuffer.size()
+                runOnUiThread {
+                    setStatus("Sports data: $got / $expectedSportsBytes байт")
+                }
+                if (expectedSportsBytes > 0 && got >= expectedSportsBytes) {
+                    finishSportsFetch("complete")
+                }
+            } else {
+                Log.w(TAG, "sports packet counter gap: got=$counter last=$sportsPacketCounter")
+                sportsPacketCounter = counter
+                if (value.size > 1) sportsDataBuffer.write(value, 1, value.size - 1)
+            }
+        } else {
+            runOnUiThread {
+                setStatus("Activity данные: ${activityBuffer.size} пак. / $activityBytesReceived байт")
+            }
         }
     }
 
@@ -1307,5 +1477,9 @@ class WatchDirectActivity : Activity() {
         private const val REQ_BLE = 2001
         /** Huami 2021 chunked endpoint for authentication (InitOperation2021). */
         private const val CHUNKED2021_ENDPOINT_AUTH: Short = 0x0082
+        /** HTTP proxy (watch → phone). */
+        private const val CHUNKED2021_ENDPOINT_HTTP: Short = 0x0001
+        /** Activity / sports fetch control (ZeppOsActivityFetchService). */
+        private const val CHUNKED2021_ENDPOINT_ACTIVITY: Short = 0x004b
     }
 }
