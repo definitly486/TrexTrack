@@ -10,7 +10,7 @@ Android/Kotlin starter project for a standalone GPX exporter targeting Amazfit T
 
 - **главный экран** — две кнопки: облако Zepp / напрямую с часами;
 - **облако** (`CloudActivity`): вход, сессия в Keystore, список тренировок, экспорт GPX, локальный GPX (как до рефакторинга);
-- **часы** (`WatchDirectActivity`): BLE-сканирование, GATT, Huami auth key, каркас загрузки треков с часов.
+- **часы** (`WatchDirectActivity`): BLE-сканирование, GATT, Huami auth key, classic AES-auth + запрос activity data; Zepp OS GPS file transfer — следующий этап.
 
 ## Прямая работа с часами
 
@@ -18,11 +18,15 @@ Android/Kotlin starter project for a standalone GPX exporter targeting Amazfit T
 
 1. **Сканировать BLE** — поиск устройств (имена с T-Rex / Amazfit / Zepp / Huami).
 2. Выбор устройства из списка.
-3. **Подключить** — GATT connect + service discovery (отображаются UUID и свойства характеристик).
-4. **Ввести Huami auth key** — опционально; для T-Rex 2 обычно нужен (как в Gadgetbridge; ключ можно получить через `huami-token` после привязки в Zepp).
-5. **Загрузить треки с часов** — каркас: проверяет соединение, наличие Huami-сервисов (`fee0`/`fee1`) и auth key; полный протокол выгрузки activity + GPS points — следующий этап (референс: Gadgetbridge Zepp OS).
+3. **Подключить** — GATT connect + service discovery (отображаются UUID и свойства характеристик, в т.ч. AUTH / ACT_DATA / Zepp FT).
+4. **Ввести / получить Huami auth key** — для T-Rex 2 обычно нужен (кнопка из аккаунта Zepp или вручную).
+5. **Загрузить треки с часов**:
+   - enable notifications (AUTH, ACTIVITY_DATA, chunked 2021 / Zepp FT при наличии);
+   - classic Huami AES-auth по auth key;
+   - запрос activity data за последние 7 дней и сбор сырых пакетов;
+   - на T-Rex 2 часто нужен ECDH (chunked 2021) + protobuf summary + file transfer GPS — это следующий этап (Gadgetbridge `InitOperation2021` / Zepp OS).
 
-Загрузка треков **из облака** уже реализована на главном экране; эта страница именно для прямого BLE.
+Загрузка треков **из облака** уже реализована; эта страница — прямой BLE.
 
 ## Build
 
@@ -59,7 +63,7 @@ Release signing is optional: set `TREXTRACK_STORE_FILE`, `TREXTRACK_STORE_PASSWO
 4. ~~Download GPS route points and map them to GPX 1.1 (`trk`, `trkseg`, `trkpt`, optional `ele` and `time`).~~
 5. Add date filters, bulk export, duplicate detection and error/retry handling (частично есть).
 6. Test with real T-Rex 2 workouts and compare coordinate count/time/elevation against source data.
-7. **Прямая синхронизация с часов**: порт логики activity/GPS sync с Huami-протокола (Gadgetbridge) поверх уже реализованного GATT + auth key.
+7. **Прямая синхронизация с часов**: classic AES-auth + activity fetch уже в `feature/watch-tracks-load`. Далее — ECDH/chunked 2021, protobuf workout summary и Zepp OS GPS file transfer → GPX.
 
 ## No Zepp dependency
 

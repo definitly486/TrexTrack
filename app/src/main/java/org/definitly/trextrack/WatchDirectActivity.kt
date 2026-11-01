@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
@@ -87,6 +88,14 @@ class WatchDirectActivity : Activity() {
     // Common Huami / Zepp OS related UUIDs (informational)
     private val HUAMI_SERVICE = UUID.fromString("0000fee0-0000-1000-8000-00805f9b34fb")
     private val HUAMI_AUTH_SERVICE = UUID.fromString("0000fee1-0000-1000-8000-00805f9b34fb")
+
+    /** Classic Huami auth state machine. */
+    private var authState = HuamiBleProtocol.AuthState.IDLE
+    private var authKeyBytes: ByteArray? = null
+    private var activityBytesReceived = 0
+    private val activityBuffer = ArrayList<ByteArray>()
+    private var pendingDescriptorWrites = 0
+    private var loadInProgress = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -444,6 +453,7 @@ class WatchDirectActivity : Activity() {
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         connected = true
+                        authState = HuamiBleProtocol.AuthState.IDLE
                         setStatus("Подключено. Обнаружение сервисов…", ok = true)
                         disconnectButton.isEnabled = true
                         loadTracksButton.isEnabled = true
@@ -455,6 +465,8 @@ class WatchDirectActivity : Activity() {
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         connected = false
+                        loadInProgress = false
+                        authState = HuamiBleProtocol.AuthState.IDLE
                         setStatus("Отключено", error = true)
                         disconnectButton.isEnabled = false
                         loadTracksButton.isEnabled = false
@@ -475,28 +487,104 @@ class WatchDirectActivity : Activity() {
                 discoveredServices = g.services ?: emptyList()
                 val sb = StringBuilder()
                 for (s in discoveredServices) {
-                    val uuid = s.uuid.toString()
-                    val short = uuid.take(8)
+                    val short = s.uuid.toString().take(8)
                     val hint = when {
-                        s.uuid == HUAMI_SERVICE -> " (Huami)"
-                        s.uuid == HUAMI_AUTH_SERVICE -> " (Huami Auth)"
+                        s.uuid == HUAMI_SERVICE -> " (Huami fee0)"
+                        s.uuid == HUAMI_AUTH_SERVICE -> " (Huami fee1)"
                         else -> ""
                     }
                     sb.append("• $short…$hint\n")
                     for (c in s.characteristics) {
                         val props = propFlags(c.properties)
-                        sb.append("    ${c.uuid.toString().take(8)}… [$props]\n")
+                        val name = when (c.uuid) {
+                            HuamiBleProtocol.CHAR_AUTH -> " AUTH"
+                            HuamiBleProtocol.CHAR_ACTIVITY_CONTROL -> " ACT_CTL"
+                            HuamiBleProtocol.CHAR_ACTIVITY_DATA -> " ACT_DATA"
+                            HuamiBleProtocol.CHAR_WORKOUT -> " WORKOUT"
+                            HuamiBleProtocol.CHAR_CHUNKED_2021_WRITE -> " CH2021_W"
+                            HuamiBleProtocol.CHAR_CHUNKED_2021_READ -> " CH2021_R"
+                            HuamiBleProtocol.CHAR_ZEPP_FT_SEND -> " ZEPP_FT_S"
+                            HuamiBleProtocol.CHAR_ZEPP_FT_RECV -> " ZEPP_FT_R"
+                            else -> ""
+                        }
+                        sb.append("    ${c.uuid.toString().take(8)}… [$props]$name\n")
                     }
                 }
                 servicesView.text = if (sb.isEmpty()) "Сервисы не найдены" else sb.toString()
                 val hasHuami = discoveredServices.any {
                     it.uuid == HUAMI_SERVICE || it.uuid == HUAMI_AUTH_SERVICE
                 }
+                val zepp = HuamiBleProtocol.hasZeppOsTransfer(g)
+                val classic = HuamiBleProtocol.hasClassicAuth(g)
                 setStatus(
-                    if (hasHuami) "Подключено, Huami-сервисы обнаружены"
-                    else "Подключено, сервисов: ${discoveredServices.size}",
+                    buildString {
+                        append(if (hasHuami) "Huami OK" else "сервисов: ${discoveredServices.size}")
+                        if (classic) append(" · classic AUTH")
+                        if (zepp) append(" · Zepp OS transfer")
+                    },
                     ok = true
                 )
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onDescriptorWrite(
+            g: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            Log.d(TAG, "onDescriptorWrite ${descriptor.characteristic?.uuid} status=$status")
+            if (pendingDescriptorWrites > 0) {
+                pendingDescriptorWrites--
+            }
+            if (pendingDescriptorWrites == 0 && loadInProgress &&
+                authState == HuamiBleProtocol.AuthState.IDLE
+            ) {
+                // Notifications enabled → start classic auth
+                handler.post { startClassicAuth(g) }
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            val value = characteristic.value ?: return
+            val uuid = characteristic.uuid
+            Log.d(TAG, "notify ${uuid.toString().take(8)}… ${HuamiBleProtocol.hex(value)}")
+
+            when (uuid) {
+                HuamiBleProtocol.CHAR_AUTH -> handleAuthNotification(g, value)
+                HuamiBleProtocol.CHAR_ACTIVITY_DATA -> handleActivityData(value)
+                else -> {
+                    // Chunked / Zepp OS transfer — log for future parser
+                    if (uuid == HuamiBleProtocol.CHAR_CHUNKED_2021_READ ||
+                        uuid == HuamiBleProtocol.CHAR_ZEPP_FT_RECV
+                    ) {
+                        activityBytesReceived += value.size
+                        activityBuffer.add(value.copyOf())
+                        runOnUiThread {
+                            setStatus(
+                                "Zepp/chunked данные: ${activityBytesReceived} байт " +
+                                    "(${activityBuffer.size} пакетов) — парсер GPS следующий этап"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            Log.d(TAG, "onCharacteristicWrite ${characteristic.uuid} status=$status")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                runOnUiThread {
+                    setStatus("Write failed ${characteristic.uuid.toString().take(8)}…: $status", error = true)
+                }
             }
         }
 
@@ -505,7 +593,6 @@ class WatchDirectActivity : Activity() {
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
-            // Reserved for future protocol reads
             Log.d(TAG, "onCharacteristicRead ${characteristic.uuid} status=$status")
         }
     }
@@ -528,6 +615,10 @@ class WatchDirectActivity : Activity() {
         } catch (_: Exception) { }
         gatt = null
         connected = false
+        loadInProgress = false
+        authState = HuamiBleProtocol.AuthState.IDLE
+        activityBuffer.clear()
+        activityBytesReceived = 0
         loadTracksButton.isEnabled = false
         disconnectButton.isEnabled = false
         connectButton.isEnabled = selectedDevice != null
@@ -567,65 +658,291 @@ class WatchDirectActivity : Activity() {
     }
 
     /**
-     * Каркас загрузки треков с часов.
-     * Полная реализация протокола Huami/Zepp OS (список activity + GPS points)
-     * — объёмная задача (см. Gadgetbridge Zepp OS support). Здесь:
-     * - проверка соединения;
-     * - проверка наличия Huami-сервисов;
-     * - учёт auth key;
-     * - понятный статус пользователю.
+     * Загрузка треков с часов:
+     * 1) проверка GATT + Huami-сервисов + auth key;
+     * 2) enable notifications (AUTH + ACTIVITY_DATA, при наличии — chunked/Zepp FT);
+     * 3) classic Huami AES-auth;
+     * 4) после auth — запрос activity data (список/сырые пакеты);
+     * 5) Zepp OS file-transfer / GPS points — структура готова, полный парсер — следующий этап.
      */
+    @SuppressLint("MissingPermission")
     private fun loadTracksFromWatch() {
-        if (!connected || gatt == null) {
+        val g = gatt
+        if (!connected || g == null) {
             Toast.makeText(this, "Сначала подключите часы", Toast.LENGTH_SHORT).show()
             return
         }
+        if (loadInProgress) {
+            Toast.makeText(this, "Загрузка уже идёт…", Toast.LENGTH_SHORT).show()
+            return
+        }
+
         val hasHuami = discoveredServices.any {
             it.uuid == HUAMI_SERVICE || it.uuid == HUAMI_AUTH_SERVICE
         }
-        val keyPresent = !authKeyHex.isNullOrBlank()
+        val keyHex = authKeyHex ?: sessionStore.getAuthKey()
+        val keyBytes = HuamiBleProtocol.parseAuthKeyHex(keyHex)
+        val classicAuth = HuamiBleProtocol.hasClassicAuth(g)
+        val activityChars = HuamiBleProtocol.hasActivityChars(g)
+        val zeppOs = HuamiBleProtocol.hasZeppOsTransfer(g)
 
-        val msg = buildString {
-            append("Запрос загрузки треков с часов\n\n")
-            append("Устройство: ${selectedDevice?.name ?: selectedDevice?.address}\n")
-            append("Huami-сервисы: ${if (hasHuami) "да" else "не обнаружены"}\n")
-            append("Auth key: ${if (keyPresent) "задан" else "не задан"}\n\n")
-            if (!hasHuami) {
-                append(
-                    "На этом соединении не видны типичные Huami UUID (fee0/fee1). " +
-                        "Возможно, часы используют другой транспорт (BT Classic / btrfcomm) " +
-                        "или требуется предварительная аутентификация.\n\n"
+        if (!hasHuami) {
+            setStatus("Нет Huami-сервисов (fee0/fee1) на соединении", error = true)
+            Toast.makeText(this, "Huami UUID не найдены", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (keyBytes == null) {
+            setStatus("Нужен auth key (16 байт hex)", error = true)
+            AlertDialog.Builder(this)
+                .setTitle("Auth key")
+                .setMessage(
+                    "Для T-Rex 2 / Amazfit нужен Huami auth key.\n\n" +
+                        "Получите его кнопкой «Получить auth key из аккаунта Zepp» " +
+                        "или введите вручную (32 hex-символа)."
                 )
-            }
-            if (!keyPresent) {
-                append(
-                    "Для T-Rex 2 обычно нужен auth key. Введите его кнопкой «Ввести Huami auth key».\n\n"
-                )
-            }
-            append(
-                "Реализация полного протокола выгрузки activity + GPS сейчас в виде каркаса. " +
-                    "Следующий шаг — портирование логики синхронизации тренировок " +
-                    "(как в Gadgetbridge для Zepp OS) поверх уже установленного GATT-соединения."
-            )
+                .setPositiveButton("OK", null)
+                .show()
+            return
         }
 
+        authKeyBytes = keyBytes
+        authState = HuamiBleProtocol.AuthState.IDLE
+        activityBytesReceived = 0
+        activityBuffer.clear()
+        loadInProgress = true
+        loadTracksButton.isEnabled = false
+
+        setStatus(
+            buildString {
+                append("Старт загрузки… ")
+                append(if (classicAuth) "classic AUTH " else "")
+                append(if (activityChars) "activity " else "")
+                append(if (zeppOs) "ZeppOS-FT " else "")
+            }
+        )
+        Log.i(
+            TAG,
+            "loadTracksFromWatch device=${selectedDevice?.address} classic=$classicAuth " +
+                "activity=$activityChars zepp=$zeppOs keyLen=${keyBytes.size}"
+        )
+
+        // Enable notifications first (descriptor writes are serialized by the stack)
+        pendingDescriptorWrites = 0
+        val toEnable = mutableListOf<BluetoothGattCharacteristic>()
+        HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_AUTH)?.let { toEnable.add(it) }
+        HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_ACTIVITY_DATA)?.let { toEnable.add(it) }
+        HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_READ)?.let { toEnable.add(it) }
+        HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_ZEPP_FT_RECV)?.let { toEnable.add(it) }
+
+        if (toEnable.isEmpty()) {
+            loadInProgress = false
+            loadTracksButton.isEnabled = true
+            setStatus("Нет характеристик для notify (AUTH/ACT_DATA)", error = true)
+            return
+        }
+
+        // Enable one-by-one; onDescriptorWrite chains the rest / starts auth
+        enableNextNotification(g, toEnable, 0)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enableNextNotification(
+        g: BluetoothGatt,
+        list: List<BluetoothGattCharacteristic>,
+        index: Int
+    ) {
+        if (index >= list.size) {
+            // All done — start auth
+            handler.post { startClassicAuth(g) }
+            return
+        }
+        val c = list[index]
+        pendingDescriptorWrites = 1
+        val ok = HuamiBleProtocol.enableNotifications(g, c)
+        if (!ok) {
+            Log.w(TAG, "enableNotifications failed for ${c.uuid}")
+            // continue with next
+            handler.post { enableNextNotification(g, list, index + 1) }
+            return
+        }
+        // Wait for onDescriptorWrite, then continue
+        // Store continuation via a one-shot runnable on next descriptor write
+        // Simpler approach: chain with delay fallback
+        handler.postDelayed({
+            if (pendingDescriptorWrites > 0) {
+                pendingDescriptorWrites = 0
+                enableNextNotification(g, list, index + 1)
+            } else {
+                // onDescriptorWrite already decremented; continue chain
+                enableNextNotification(g, list, index + 1)
+            }
+        }, 400)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startClassicAuth(g: BluetoothGatt) {
+        val authChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_AUTH)
+        if (authChar == null) {
+            // No classic AUTH — try activity fetch anyway (some firmwares) or report Zepp path
+            if (HuamiBleProtocol.hasZeppOsTransfer(g)) {
+                setStatus(
+                    "Classic AUTH нет — обнаружен Zepp OS transfer. " +
+                        "ECDH/chunked auth и GPS file transfer — следующий этап. " +
+                        "Сервисы готовы, ключ сохранён."
+                )
+                finishLoadWithSummary(
+                    authenticated = false,
+                    note = "Zepp OS: нужен ECDH (InitOperation2021), не classic AES"
+                )
+            } else {
+                setStatus("Нет AUTH characteristic — auth невозможен", error = true)
+                finishLoadWithSummary(false, "нет CHAR_AUTH")
+            }
+            return
+        }
+
+        authState = HuamiBleProtocol.AuthState.WAITING_RANDOM
+        setStatus("Auth: запрос random…")
+        authChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        authChar.value = HuamiBleProtocol.packetRequestRandom()
+        val ok = g.writeCharacteristic(authChar)
+        if (!ok) {
+            setStatus("Auth: writeCharacteristic failed", error = true)
+            finishLoadWithSummary(false, "write AUTH failed")
+        }
+        // Timeout
+        handler.postDelayed({
+            if (authState == HuamiBleProtocol.AuthState.WAITING_RANDOM ||
+                authState == HuamiBleProtocol.AuthState.WAITING_CONFIRM
+            ) {
+                setStatus("Auth: таймаут ожидания ответа часов", error = true)
+                authState = HuamiBleProtocol.AuthState.FAILED
+                finishLoadWithSummary(false, "auth timeout")
+            }
+        }, 12_000)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleAuthNotification(g: BluetoothGatt, value: ByteArray) {
+        val key = authKeyBytes ?: return
+        val result = HuamiBleProtocol.parseAuthNotification(value, key) ?: return
+        when (result) {
+            is HuamiBleProtocol.AuthParseResult.GotRandom -> {
+                authState = HuamiBleProtocol.AuthState.WAITING_CONFIRM
+                runOnUiThread { setStatus("Auth: random получен, отправка AES…") }
+                val authChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_AUTH)
+                    ?: return
+                authChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                authChar.value = HuamiBleProtocol.packetEncryptedRandom(result.encryptedResponse)
+                g.writeCharacteristic(authChar)
+            }
+            HuamiBleProtocol.AuthParseResult.KeyAccepted -> {
+                // Some devices need SEND_KEY first; we requested random already
+                runOnUiThread { setStatus("Auth: key accepted, request random…") }
+                val authChar = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_AUTH)
+                    ?: return
+                authChar.value = HuamiBleProtocol.packetRequestRandom()
+                g.writeCharacteristic(authChar)
+            }
+            HuamiBleProtocol.AuthParseResult.Success -> {
+                authState = HuamiBleProtocol.AuthState.AUTHENTICATED
+                runOnUiThread { setStatus("Auth: успех. Запрос activity…", ok = true) }
+                handler.post { requestActivityData(g) }
+            }
+            HuamiBleProtocol.AuthParseResult.Fail -> {
+                authState = HuamiBleProtocol.AuthState.FAILED
+                runOnUiThread {
+                    setStatus("Auth: отказ (проверьте auth key)", error = true)
+                    finishLoadWithSummary(false, "AUTH_FAIL — неверный ключ или нужна ECDH")
+                }
+            }
+            is HuamiBleProtocol.AuthParseResult.Unknown -> {
+                Log.w(TAG, "auth unknown: ${HuamiBleProtocol.hex(result.raw)}")
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestActivityData(g: BluetoothGatt) {
+        val control = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_ACTIVITY_CONTROL)
+        if (control == null) {
+            finishLoadWithSummary(
+                authenticated = true,
+                note = "AUTH OK, но нет ACTIVITY_CONTROL — GPS через Zepp file transfer"
+            )
+            return
+        }
+        // Request from 7 days ago
+        val from = System.currentTimeMillis() / 1000 - 7 * 24 * 3600
+        control.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        control.value = HuamiBleProtocol.packetFetchActivityFrom(from)
+        val ok1 = g.writeCharacteristic(control)
+        Log.i(TAG, "write activity start-date ok=$ok1 from=$from")
+
+        handler.postDelayed({
+            control.value = HuamiBleProtocol.packetFetchData()
+            val ok2 = g.writeCharacteristic(control)
+            Log.i(TAG, "write FETCH_DATA ok=$ok2")
+            runOnUiThread { setStatus("Запрос activity data отправлен, ждём пакеты…") }
+        }, 500)
+
+        // Collect for a few seconds, then summarize
+        handler.postDelayed({
+            finishLoadWithSummary(
+                authenticated = true,
+                note = "получено activity-пакетов: ${activityBuffer.size} " +
+                    "(${activityBytesReceived} байт)"
+            )
+        }, 8_000)
+    }
+
+    private fun handleActivityData(value: ByteArray) {
+        activityBytesReceived += value.size
+        activityBuffer.add(value.copyOf())
+        Log.d(TAG, "activity chunk #${activityBuffer.size} len=${value.size} " +
+            "head=${HuamiBleProtocol.hex(value.copyOf(minOf(8, value.size)))}")
+        runOnUiThread {
+            setStatus("Activity данные: ${activityBuffer.size} пак. / $activityBytesReceived байт")
+        }
+    }
+
+    private fun finishLoadWithSummary(authenticated: Boolean, note: String) {
+        loadInProgress = false
+        loadTracksButton.isEnabled = true
+        val g = gatt
+        val zepp = g != null && HuamiBleProtocol.hasZeppOsTransfer(g)
+        val msg = buildString {
+            append("Результат загрузки с часов\n\n")
+            append("Устройство: ${selectedDevice?.name ?: selectedDevice?.address}\n")
+            append("Auth: ${if (authenticated) "OK (classic AES)" else "не завершён"}\n")
+            append("Activity packets: ${activityBuffer.size} ($activityBytesReceived байт)\n")
+            append("Zepp OS transfer chars: ${if (zepp) "да" else "нет"}\n")
+            append("\n$note\n\n")
+            if (authenticated && activityBuffer.isNotEmpty()) {
+                append(
+                    "Сырые activity-пакеты получены. Разбор summary + GPS track points " +
+                        "(и Zepp OS file transfer) — следующий этап портирования Gadgetbridge.\n"
+                )
+            } else if (zepp && !authenticated) {
+                append(
+                    "На T-Rex 2 обычно ECDH-auth (chunked 2021) + protobuf workout summary + " +
+                        "file transfer GPS. Classic AES — запасной путь для более старых Huami.\n"
+                )
+            }
+            append("\nЛоги: adb logcat -s WatchDirect HuamiBle")
+        }
         AlertDialog.Builder(this)
             .setTitle("Треки с часов")
             .setMessage(msg)
             .setPositiveButton("OK", null)
             .show()
-
         setStatus(
-            when {
-                !hasHuami -> "Треки: нет Huami-сервисов на соединении"
-                !keyPresent -> "Треки: нужен auth key (каркас готов)"
-                else -> "Треки: каркас готов, протокол — следующий этап"
-            }
+            if (authenticated) "Готово: $note"
+            else "Остановлено: $note",
+            ok = authenticated,
+            error = !authenticated
         )
-        Log.i(
-            TAG,
-            "loadTracksFromWatch device=${selectedDevice?.address} huami=$hasHuami key=$keyPresent services=${discoveredServices.size}"
-        )
+        Log.i(TAG, "finishLoad auth=$authenticated note=$note packets=${activityBuffer.size}")
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
