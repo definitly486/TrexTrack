@@ -1549,10 +1549,14 @@ class WatchDirectActivity : Activity() {
         val hour = payload[offset + 4].toInt() and 0xff
         val min = payload[offset + 5].toInt() and 0xff
         val sec = if (payload.size > offset + 6) payload[offset + 6].toInt() and 0xff else 0
-        // Huami's START_DATE response carries its own timezone in byte 14.
-        // Gadgetbridge's rawBytesToCalendar() uses a fixed-offset timezone;
-        // for this watch the returned offset is UTC (0), not the phone timezone.
-        return java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
+        // Match Gadgetbridge BLETypeConversions.rawBytesToCalendar():
+        // construct the wall-clock fields in the phone's default timezone first,
+        // then apply the fixed offset reported by the watch. This matters when
+        // the watch reports UTC (0) while the phone is GMT+03:00.
+        val watchOffset = if (payload.size > offset + 7) {
+            payload[offset + 7].toInt() * 15 * 60 * 1000
+        } else 0
+        return java.util.Calendar.getInstance().apply {
             set(java.util.Calendar.YEAR, year)
             set(java.util.Calendar.MONTH, month - 1)
             set(java.util.Calendar.DAY_OF_MONTH, day)
@@ -1560,6 +1564,9 @@ class WatchDirectActivity : Activity() {
             set(java.util.Calendar.MINUTE, min)
             set(java.util.Calendar.SECOND, sec)
             set(java.util.Calendar.MILLISECOND, 0)
+            val fixedZone = java.util.TimeZone.getTimeZone("UTC")
+            fixedZone.rawOffset = watchOffset
+            timeZone = fixedZone
         }
     }
 
@@ -1576,25 +1583,25 @@ class WatchDirectActivity : Activity() {
         sportsFetchMetaComplete = false
         finishPosted = false
 
-        // The 0x06 request is for the specific workout returned by the 0x05
-        // summary query. Use the exact UTC timestamp (including seconds) supplied
-        // by the watch in START_DATE metadata. Rebuilding from the phone calendar
-        // or reusing the 30-day summary cursor can make T-Rex 2 report zero details.
+        // Match Gadgetbridge's FetchSportsDetailsOperation exactly: it converts
+        // START_DATE with rawBytesToCalendar(), then getTimeBytes(..., MINUTES).
+        // Do not send the raw response bytes: on this watch timezone=0 and the
+        // phone is GMT+03, so Gadgetbridge's Calendar conversion shifts the
+        // wall-clock fields before serializing the request.
         val summaryEpoch = lastParsedSummary?.startTimestampSec
-        val timeBytes = sportsSinceTimeBytes?.copyOf() ?: run {
+        val workoutCalendar = sportsSinceCal ?: run {
             val summaryTime = summaryEpoch
                 ?: throw IllegalStateException("Нет времени тренировки для запроса GPS details")
-            val workoutStart = java.util.Calendar.getInstance(
-                java.util.TimeZone.getTimeZone("UTC")
-            ).apply {
+            java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
                 timeInMillis = summaryTime * 1000L
             }
-            huamiTimeBytes(workoutStart)
         }
+        val timeBytes = huamiTimeBytes(workoutCalendar)
         Log.i(
             TAG,
-            "details date source=watch-workout-start " +
+            "details date source=gadgetbridge-calendar-minutes " +
                 "summaryEpoch=$summaryEpoch watchBytes=${sportsSinceTimeBytes?.let { HuamiBleProtocol.hex(it) }} " +
+                "calendar=${workoutCalendar.time} tzOffsetMs=${workoutCalendar.timeZone.rawOffset} " +
                 "requestBytes=${HuamiBleProtocol.hex(timeBytes)}"
         )
         val cmd = ByteArray(2 + timeBytes.size)
