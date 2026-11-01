@@ -65,6 +65,7 @@ class WatchDirectActivity : Activity() {
     private lateinit var loadTracksButton: Button
     private lateinit var disconnectButton: Button
     private lateinit var authKeyButton: Button
+    private lateinit var exportAuthKeyButton: Button
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var scanning = false
@@ -86,6 +87,7 @@ class WatchDirectActivity : Activity() {
     private lateinit var keyStatusView: TextView
     private var pendingGpxContent: String? = null
     private var pendingGpxName: String? = null
+    private var pendingAuthKeyExport: String? = null
 
     // Common Huami / Zepp OS related UUIDs (informational)
     private val HUAMI_SERVICE = UUID.fromString("0000fee0-0000-1000-8000-00805f9b34fb")
@@ -208,6 +210,13 @@ class WatchDirectActivity : Activity() {
         }
         content.addView(keyStatusView, matchWrap())
 
+        exportAuthKeyButton = Button(this).apply {
+            text = "Сохранить auth key в файл для Gadgetbridge"
+            isEnabled = false
+            setOnClickListener { saveAuthKeyToFile() }
+        }
+        content.addView(exportAuthKeyButton, matchWrap())
+
         loadTracksButton = Button(this).apply {
             text = "Загрузить треки с часов"
             isEnabled = false
@@ -267,6 +276,25 @@ class WatchDirectActivity : Activity() {
     @Deprecated("Deprecated in Android API; retained for compatibility with minSdk 26")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_SAVE_AUTH_KEY) {
+            val key = pendingAuthKeyExport
+            pendingAuthKeyExport = null
+            val uri = data?.data
+            if (resultCode != RESULT_OK || uri == null || key == null) {
+                setStatus("Экспорт auth key отменён")
+                return
+            }
+            try {
+                contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(key) }
+                    ?: throw java.io.IOException("Не удалось открыть файл для записи")
+                setStatus("Auth key сохранён в файл для Gadgetbridge", ok = true)
+                Toast.makeText(this, "Auth key сохранён", Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Log.e(TAG, "Auth key export failed", e)
+                setStatus("Ошибка сохранения auth key: ${e.message}", error = true)
+            }
+            return
+        }
         if (requestCode != REQ_SAVE_GPX) return
 
         val content = pendingGpxContent
@@ -288,6 +316,33 @@ class WatchDirectActivity : Activity() {
             Log.e(TAG, "GPX export failed", e)
             setStatus("Ошибка сохранения GPX: ${e.message}", error = true)
             Toast.makeText(this, "Не удалось сохранить GPX: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** Экспортирует только 32-значный hex auth key: такой формат удобно вставлять в Gadgetbridge. */
+    private fun saveAuthKeyToFile() {
+        val key = (authKeyHex ?: sessionStore.getAuthKey())
+            ?.trim()?.lowercase()?.removePrefix("0x")
+        if (key.isNullOrBlank()) {
+            setStatus("Сначала получите или введите auth key", error = true)
+            return
+        }
+        if (!key.matches(Regex("[0-9a-fA-F]{32}"))) {
+            setStatus("Auth key должен содержать ровно 32 hex-символа", error = true)
+            return
+        }
+        pendingAuthKeyExport = key
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TITLE, "trex2_authkey.txt")
+        }
+        try {
+            startActivityForResult(intent, REQ_SAVE_AUTH_KEY)
+        } catch (e: Exception) {
+            pendingAuthKeyExport = null
+            Log.e(TAG, "Unable to open auth key document picker", e)
+            setStatus("Не удалось открыть выбор файла: ${e.message}", error = true)
         }
     }
 
@@ -1767,6 +1822,7 @@ class WatchDirectActivity : Activity() {
             }
         }
         keyStatusView.setTextColor(if (key.isNullOrBlank()) 0xFF8A3B12.toInt() else 0xFF1B5E20.toInt())
+        if (::exportAuthKeyButton.isInitialized) exportAuthKeyButton.isEnabled = !key.isNullOrBlank()
     }
 
     /**
@@ -1854,6 +1910,7 @@ class WatchDirectActivity : Activity() {
         private const val TAG = "WatchDirect"
         private const val REQ_BLE = 2001
         private const val REQ_SAVE_GPX = 2002
+        private const val REQ_SAVE_AUTH_KEY = 2003
         /** Huami 2021 chunked endpoint for authentication (InitOperation2021). */
         private const val CHUNKED2021_ENDPOINT_AUTH: Short = 0x0082
         /** HTTP proxy (watch → phone). */
