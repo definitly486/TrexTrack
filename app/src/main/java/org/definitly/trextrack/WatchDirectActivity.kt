@@ -1556,18 +1556,16 @@ class WatchDirectActivity : Activity() {
         val watchOffset = if (payload.size > offset + 7) {
             payload[offset + 7].toInt() * 15 * 60 * 1000
         } else 0
-        return java.util.Calendar.getInstance().apply {
-            set(java.util.Calendar.YEAR, year)
-            set(java.util.Calendar.MONTH, month - 1)
-            set(java.util.Calendar.DAY_OF_MONTH, day)
-            set(java.util.Calendar.HOUR_OF_DAY, hour)
-            set(java.util.Calendar.MINUTE, min)
-            set(java.util.Calendar.SECOND, sec)
-            set(java.util.Calendar.MILLISECOND, 0)
-            val fixedZone = java.util.TimeZone.getTimeZone("UTC")
-            fixedZone.rawOffset = watchOffset
-            timeZone = fixedZone
-        }
+        // Use the same constructor as Gadgetbridge's rawBytesToCalendar().
+        // Constructing via Calendar.getInstance().apply { set(...) } leaves the
+        // fields pending; changing the timezone before they are resolved can keep
+        // the original wall-clock fields instead of preserving the instant.
+        val timestamp = java.util.GregorianCalendar(year, month - 1, day, hour, min, sec)
+        timestamp.set(java.util.Calendar.MILLISECOND, 0)
+        val fixedZone = java.util.TimeZone.getTimeZone("UTC")
+        fixedZone.rawOffset = watchOffset
+        timestamp.timeZone = fixedZone
+        return timestamp
     }
 
     /** Fetch GPS/track details (type 0x06) for the last summary start time. */
@@ -1583,11 +1581,9 @@ class WatchDirectActivity : Activity() {
         sportsFetchMetaComplete = false
         finishPosted = false
 
-        // Match Gadgetbridge's FetchSportsDetailsOperation exactly: it converts
-        // START_DATE with rawBytesToCalendar(), then getTimeBytes(..., MINUTES).
-        // Do not send the raw response bytes: on this watch timezone=0 and the
-        // phone is GMT+03, so Gadgetbridge's Calendar conversion shifts the
-        // wall-clock fields before serializing the request.
+        // Match Gadgetbridge's FetchSportsDetailsOperation: it uses the summary
+        // start timestamp, converts START_DATE with rawBytesToCalendar(), then
+        // serializes the resulting calendar at minute precision.
         val summaryEpoch = lastParsedSummary?.startTimestampSec
         val workoutCalendar = sportsSinceCal ?: run {
             val summaryTime = summaryEpoch
