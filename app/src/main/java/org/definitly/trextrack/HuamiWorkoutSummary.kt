@@ -96,7 +96,7 @@ object HuamiWorkoutSummaryParser {
                         when (f) {
                             1 -> if (w == 0) startTs = (v as Long)
                             5 -> if (w == 0) baseLat = (v as Long).toInt() / 6_000_000.0
-                            6 -> if (w == 0) baseLon = (v as Long).toInt() / -6_000_000.0
+                            6 -> if (w == 0) baseLon = (v as Long).toInt() / 6_000_000.0
                             7 -> if (w == 0) baseAlt = (v as Long).toInt() / 2.0
                         }
                     }
