@@ -110,6 +110,8 @@ class WatchDirectActivity : Activity() {
     private var negotiatedMtu: Int = 23
     private val supportedEndpoints = mutableSetOf<Short>()
     private var activityEndpointEncrypted = true
+    /** true → write sports cmds via 0x004b; false → classic CHAR_ACTIVITY_CONTROL */
+    private var useChunkedActivityFetch = false
 
     // Sports summary fetch (endpoint 0x004b)
     private var sportsFetchActive = false
@@ -643,6 +645,7 @@ class WatchDirectActivity : Activity() {
 
             when (uuid) {
                 HuamiBleProtocol.CHAR_AUTH -> handleAuthNotification(g, value)
+                HuamiBleProtocol.CHAR_ACTIVITY_CONTROL -> handleActivityControlEndpoint(g, value)
                 HuamiBleProtocol.CHAR_ACTIVITY_DATA -> handleActivityData(value)
                 HuamiBleProtocol.CHAR_CHUNKED_2021_READ -> handleChunked2021Notify(g, value)
                 HuamiBleProtocol.CHAR_ZEPP_FT_RECV -> {
@@ -818,6 +821,8 @@ class WatchDirectActivity : Activity() {
         pendingDescriptorWrites = 0
         val toEnable = mutableListOf<BluetoothGattCharacteristic>()
         HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_AUTH)?.let { toEnable.add(it) }
+        // Classic activity control meta responses arrive as notifications on 0x0004
+        HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_ACTIVITY_CONTROL)?.let { toEnable.add(it) }
         HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_ACTIVITY_DATA)?.let { toEnable.add(it) }
         HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_READ)?.let { toEnable.add(it) }
         HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_ZEPP_FT_RECV)?.let { toEnable.add(it) }
@@ -1079,15 +1084,15 @@ class WatchDirectActivity : Activity() {
             }
         }
         val hasActivity = supportedEndpoints.contains(CHUNKED2021_ENDPOINT_ACTIVITY)
-        Log.i(TAG, "has activity 0x004b=$hasActivity encrypted=$activityEndpointEncrypted")
-        runOnUiThread { setStatus("Сервисы: $num, activity=$hasActivity — sports…") }
-        if (hasActivity) {
-            requestSportsSummaries(g)
-        } else {
-            // Still try activity fetch — some firmwares omit listing
-            Log.w(TAG, "0x004b not in list, trying sports anyway")
-            requestSportsSummaries(g)
+        useChunkedActivityFetch = hasActivity
+        Log.i(TAG, "has activity 0x004b=$hasActivity encrypted=$activityEndpointEncrypted useChunked=$useChunkedActivityFetch")
+        runOnUiThread {
+            setStatus(
+                if (hasActivity) "Сервисы: $num, sports via 0x004b…"
+                else "Сервисы: $num, sports via classic ACT_CTL…"
+            )
         }
+        requestSportsSummaries(g)
     }
 
     @SuppressLint("MissingPermission")
@@ -1207,12 +1212,12 @@ class WatchDirectActivity : Activity() {
                 expectedSportsBytes = expected
                 if (expected == 0) {
                     // ACK and finish — no workouts
-                    writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY), encrypt = activityEndpointEncrypted)
+                    writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY))
                     finishLoadWithSummary(true, "Нет sports summary с указанной даты (0 байт)")
                 } else {
                     runOnUiThread { setStatus("Sports: ждут $expected байт, FETCH_DATA…") }
                     sportsFetchActive = true
-                    writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_FETCH_DATA), encrypt = activityEndpointEncrypted)
+                    writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_FETCH_DATA))
                 }
             }
             HuamiBleProtocol.CMD_FETCH_DATA -> {
@@ -1282,15 +1287,36 @@ class WatchDirectActivity : Activity() {
         cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
         cmd[1] = 0x05 // SPORTS_SUMMARIES
         System.arraycopy(timeBytes, 0, cmd, 2, timeBytes.size)
-        Log.i(TAG, "request sports summaries cmd=${HuamiBleProtocol.hex(cmd)} encrypt=$activityEndpointEncrypted")
+        Log.i(
+            TAG,
+            "request sports summaries cmd=${HuamiBleProtocol.hex(cmd)} " +
+                "via=${if (useChunkedActivityFetch) "0x004b" else "classic"} enc=$activityEndpointEncrypted"
+        )
         runOnUiThread { setStatus("Запрос sports summaries (30 дней)…") }
-        writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, cmd, encrypt = activityEndpointEncrypted)
+        writeActivityControl(g, cmd)
 
         handler.postDelayed({
             if (loadInProgress && !finishPosted) {
                 finishSportsFetch("timeout")
             }
         }, 20_000)
+    }
+
+    /** Write activity/sports control either via 0x004b or classic characteristic. */
+    @SuppressLint("MissingPermission")
+    private fun writeActivityControl(g: BluetoothGatt, data: ByteArray) {
+        if (useChunkedActivityFetch) {
+            writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, data, encrypt = activityEndpointEncrypted)
+            return
+        }
+        val control = HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_ACTIVITY_CONTROL)
+        if (control == null) {
+            Log.e(TAG, "no CHAR_ACTIVITY_CONTROL")
+            finishLoadWithSummary(true, "нет CHAR_ACTIVITY_CONTROL и нет 0x004b")
+            return
+        }
+        Log.i(TAG, "classic ACT_CTL write props=0x${"%02x".format(control.properties)} len=${data.size}")
+        queueGattWrite(g, control, data)
     }
 
     /** year_lo, year_hi, month, day, hour, minute, seconds(0), tz */
@@ -1318,7 +1344,7 @@ class WatchDirectActivity : Activity() {
         // ACK if we got something
         gatt?.let { g ->
             if (raw.isNotEmpty()) {
-                writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY), encrypt = activityEndpointEncrypted)
+                writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY))
             }
         }
         finishLoadWithSummary(true, note)
