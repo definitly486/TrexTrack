@@ -123,6 +123,9 @@ class WatchDirectActivity : Activity() {
     /** FETCH_DATA completion metadata must arrive before ACK / next fetch. */
     private var sportsFetchMetaComplete = false
     private var sportsSinceCal: java.util.Calendar? = null
+    /** Exact lower-bound timestamp used for the summary request. Gadgetbridge reuses
+     * this same last-sync timestamp for the subsequent details request. */
+    private var sportsFetchSinceTimeBytes: ByteArray? = null
     /** Exact timestamp bytes returned by the watch (year..second, timezone). */
     private var sportsSinceTimeBytes: ByteArray? = null
     private var lastParsedSummary: ParsedWorkoutSummary? = null
@@ -1422,6 +1425,11 @@ class WatchDirectActivity : Activity() {
             set(java.util.Calendar.MILLISECOND, 0)
         }
         val timeBytes = huamiTimeBytes(since)
+        // Gadgetbridge's summary and details operations share lastSportsActivityTimeMillis.
+        // Save the exact lower bound so type 0x06 uses the same timestamp, not the
+        // watch's returned last-activity timestamp from the START_DATE response.
+        sportsFetchSinceTimeBytes = timeBytes.copyOf()
+        Log.i(TAG, "sports sync lower-bound=${HuamiBleProtocol.hex(sportsFetchSinceTimeBytes!!)}")
         // 0x01 = START_DATE, 0x05 = SPORTS_SUMMARIES
         val cmd = ByteArray(2 + timeBytes.size)
         cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
@@ -1568,24 +1576,25 @@ class WatchDirectActivity : Activity() {
         sportsFetchMetaComplete = false
         finishPosted = false
 
-        // Match Gadgetbridge's FetchSportsDetailsOperation: its summary start time
-        // originates from HuamiSupport.fromTimeBytes(), which preserves the watch's
-        // fixed timezone offset. Do not rebuild this date in the phone's timezone.
+        // Gadgetbridge's FetchSportsSummaryOperation and FetchSportsDetailsOperation
+        // use the same lastSportsActivityTimeMillis lower-bound. The summary response's
+        // bytes 7..14 describe the watch's last activity, not the next request cursor.
+        // Reuse the exact bytes sent in type 0x05; changing to the returned activity
+        // timestamp makes T-Rex 2 answer type 0x06 with expectedDataLength=0.
         val summaryEpoch = lastParsedSummary?.startTimestampSec
-        val requestCalendar = sportsSinceCal ?: summaryEpoch?.let { sec ->
-            java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
-                timeInMillis = sec * 1000L
+        val timeBytes = sportsFetchSinceTimeBytes?.copyOf() ?: run {
+            val fallback = java.util.Calendar.getInstance().apply {
+                add(java.util.Calendar.DAY_OF_YEAR, -30)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
             }
-        } ?: java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
-            add(java.util.Calendar.DAY_OF_YEAR, -30)
+            huamiTimeBytes(fallback)
         }
-        val timeBytes = huamiTimeBytes(requestCalendar)
         Log.i(
             TAG,
-            "details date source=${if (sportsSinceCal != null) "watch-fixed-offset-calendar" else if (summaryEpoch != null) "summary-utc-fallback" else "fallback-calendar"} " +
+            "details date source=summary-request-lower-bound " +
                 "summaryEpoch=$summaryEpoch watchBytes=${sportsSinceTimeBytes?.let { HuamiBleProtocol.hex(it) }} " +
-                "requestBytes=${HuamiBleProtocol.hex(timeBytes)} " +
-                "calendar=${requestCalendar.time} tz=${requestCalendar.timeZone.id}"
+                "requestBytes=${HuamiBleProtocol.hex(timeBytes)}"
         )
         val cmd = ByteArray(2 + timeBytes.size)
         cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
