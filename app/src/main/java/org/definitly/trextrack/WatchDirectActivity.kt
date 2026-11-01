@@ -118,6 +118,11 @@ class WatchDirectActivity : Activity() {
     private var expectedSportsBytes = -1
     private var sportsPacketCounter: Byte = -1
     private val sportsDataBuffer = java.io.ByteArrayOutputStream()
+    /** 0x05 summaries, 0x06 details */
+    private var sportsFetchType: Byte = 0x05
+    private var sportsSinceCal: java.util.Calendar? = null
+    private var lastParsedSummary: ParsedWorkoutSummary? = null
+    private var lastGpsPoints: List<GpsPoint> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1208,14 +1213,27 @@ class WatchDirectActivity : Activity() {
                         ((payload[5].toInt() and 0xff) shl 16) or
                         ((payload[6].toInt() and 0xff) shl 24)
                 } else 0
-                Log.i(TAG, "sports expectedDataLength=$expected")
+                // date starts at offset 7
+                if (payload.size >= 15) {
+                    sportsSinceCal = calendarFromHuamiBytes(payload, 7)
+                    Log.i(TAG, "sports since from watch: ${sportsSinceCal?.time}")
+                }
+                Log.i(TAG, "sports expectedDataLength=$expected type=0x${"%02x".format(sportsFetchType)}")
                 expectedSportsBytes = expected
                 if (expected == 0) {
-                    // ACK and finish — no workouts
                     writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY))
-                    finishLoadWithSummary(true, "Нет sports summary с указанной даты (0 байт)")
+                    if (sportsFetchType == 0x05.toByte()) {
+                        finishLoadWithSummary(true, "Нет sports summary с указанной даты (0 байт)")
+                    } else {
+                        finishLoadWithSummary(true, "Нет GPS details (0 байт). Summary: ${lastParsedSummary?.shortDescription()}")
+                    }
                 } else {
-                    runOnUiThread { setStatus("Sports: ждут $expected байт, FETCH_DATA…") }
+                    runOnUiThread {
+                        setStatus(
+                            if (sportsFetchType == 0x05.toByte()) "Sports summary: ждут $expected байт…"
+                            else "GPS details: ждут $expected байт…"
+                        )
+                    }
                     sportsFetchActive = true
                     writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_FETCH_DATA))
                 }
@@ -1275,6 +1293,9 @@ class WatchDirectActivity : Activity() {
         sportsPacketCounter = (-1).toByte()
         sportsFetchActive = false
         expectedSportsBytes = -1
+        sportsFetchType = 0x05
+        lastParsedSummary = null
+        lastGpsPoints = emptyList()
 
         val since = java.util.Calendar.getInstance().apply {
             add(java.util.Calendar.DAY_OF_YEAR, -30)
@@ -1339,15 +1360,112 @@ class WatchDirectActivity : Activity() {
         sportsFetchActive = false
         val raw = sportsDataBuffer.toByteArray()
         val head = HuamiBleProtocol.hex(raw.copyOf(minOf(32, raw.size)))
-        val note = "sports fetch ($reason): buffer=${raw.size} bytes, expected=$expectedSportsBytes, head=$head"
-        Log.i(TAG, note)
-        // ACK if we got something
+        Log.i(TAG, "sports fetch ($reason) type=0x${"%02x".format(sportsFetchType)} buffer=${raw.size} expected=$expectedSportsBytes head=$head")
+
         gatt?.let { g ->
             if (raw.isNotEmpty()) {
                 writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY))
             }
         }
-        finishLoadWithSummary(true, note)
+
+        if (sportsFetchType == 0x05.toByte()) {
+            val parsed = if (raw.isNotEmpty()) HuamiWorkoutSummaryParser.parse(raw) else null
+            lastParsedSummary = parsed
+            val desc = parsed?.shortDescription() ?: "buffer=${raw.size} bytes"
+            Log.i(TAG, "parsed summary: $desc")
+            // Chain GPS details if we got a summary with a usable time
+            val g = gatt
+            if (g != null && raw.isNotEmpty() && (parsed?.hasGps == true || sportsSinceCal != null)) {
+                runOnUiThread { setStatus("Summary OK. Запрос GPS details…
+$desc") }
+                handler.postDelayed({ requestSportsDetails(g) }, 500)
+                return
+            }
+            finishLoadWithSummary(true, "Summary: $desc")
+        } else {
+            // details
+            val points = if (raw.isNotEmpty()) HuamiGpsDetailsParser.parse(raw) else emptyList()
+            lastGpsPoints = points
+            val summaryLine = lastParsedSummary?.shortDescription() ?: "—"
+            var gpxPath: String? = null
+            if (points.isNotEmpty()) {
+                try {
+                    val dir = getExternalFilesDir(null) ?: filesDir
+                    val f = java.io.File(dir, "trex_track_${System.currentTimeMillis()}.gpx")
+                    f.writeText(HuamiGpsDetailsParser.toGpx(points, summaryLine))
+                    gpxPath = f.absolutePath
+                    Log.i(TAG, "GPX written: $gpxPath (${points.size} pts)")
+                } catch (e: Exception) {
+                    Log.e(TAG, "GPX write failed", e)
+                }
+            }
+            val note = buildString {
+                append("Summary: ").append(summaryLine).append('
+')
+                append("GPS points: ").append(points.size)
+                if (points.isNotEmpty()) {
+                    val first = points.first()
+                    val last = points.last()
+                    append("
+First: %.5f, %.5f".format(first.latitude, first.longitude))
+                    append("
+Last: %.5f, %.5f".format(last.latitude, last.longitude))
+                }
+                if (gpxPath != null) append("
+GPX: ").append(gpxPath)
+            }
+            finishLoadWithSummary(true, note)
+        }
+    }
+
+    private fun calendarFromHuamiBytes(payload: ByteArray, offset: Int): java.util.Calendar {
+        val year = (payload[offset].toInt() and 0xff) or ((payload[offset + 1].toInt() and 0xff) shl 8)
+        val month = payload[offset + 2].toInt() and 0xff
+        val day = payload[offset + 3].toInt() and 0xff
+        val hour = payload[offset + 4].toInt() and 0xff
+        val min = payload[offset + 5].toInt() and 0xff
+        val sec = if (payload.size > offset + 6) payload[offset + 6].toInt() and 0xff else 0
+        return java.util.Calendar.getInstance().apply {
+            set(java.util.Calendar.YEAR, year)
+            set(java.util.Calendar.MONTH, month - 1)
+            set(java.util.Calendar.DAY_OF_MONTH, day)
+            set(java.util.Calendar.HOUR_OF_DAY, hour)
+            set(java.util.Calendar.MINUTE, min)
+            set(java.util.Calendar.SECOND, sec)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+    }
+
+    /** Fetch GPS/track details (type 0x06) for the last summary start time. */
+    @SuppressLint("MissingPermission")
+    private fun requestSportsDetails(g: BluetoothGatt) {
+        activityBuffer.clear()
+        activityBytesReceived = 0
+        sportsDataBuffer.reset()
+        sportsPacketCounter = (-1).toByte()
+        sportsFetchActive = false
+        expectedSportsBytes = -1
+        sportsFetchType = 0x06
+        finishPosted = false
+
+        val since = sportsSinceCal ?: lastParsedSummary?.startTimestampSec?.let { sec ->
+            java.util.Calendar.getInstance().apply { timeInMillis = sec * 1000L }
+        } ?: java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, -30) }
+
+        val timeBytes = huamiTimeBytes(since)
+        val cmd = ByteArray(2 + timeBytes.size)
+        cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
+        cmd[1] = 0x06 // SPORTS_DETAILS
+        System.arraycopy(timeBytes, 0, cmd, 2, timeBytes.size)
+        Log.i(TAG, "request sports DETAILS cmd=${HuamiBleProtocol.hex(cmd)} since=${since.time}")
+        runOnUiThread { setStatus("Запрос GPS details…") }
+        writeActivityControl(g, cmd)
+
+        handler.postDelayed({
+            if (loadInProgress && !finishPosted && sportsFetchType == 0x06.toByte()) {
+                finishSportsFetch("timeout-details")
+            }
+        }, 30_000)
     }
 
     @SuppressLint("MissingPermission")
