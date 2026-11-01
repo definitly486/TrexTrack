@@ -1576,23 +1576,24 @@ class WatchDirectActivity : Activity() {
         sportsFetchMetaComplete = false
         finishPosted = false
 
-        // Gadgetbridge's FetchSportsSummaryOperation and FetchSportsDetailsOperation
-        // use the same lastSportsActivityTimeMillis lower-bound. The summary response's
-        // bytes 7..14 describe the watch's last activity, not the next request cursor.
-        // Reuse the exact bytes sent in type 0x05; changing to the returned activity
-        // timestamp makes T-Rex 2 answer type 0x06 with expectedDataLength=0.
+        // The 0x06 request is for the specific workout returned by the 0x05
+        // summary query. Use the exact UTC timestamp (including seconds) supplied
+        // by the watch in START_DATE metadata. Rebuilding from the phone calendar
+        // or reusing the 30-day summary cursor can make T-Rex 2 report zero details.
         val summaryEpoch = lastParsedSummary?.startTimestampSec
-        val timeBytes = sportsFetchSinceTimeBytes?.copyOf() ?: run {
-            val fallback = java.util.Calendar.getInstance().apply {
-                add(java.util.Calendar.DAY_OF_YEAR, -30)
-                set(java.util.Calendar.SECOND, 0)
-                set(java.util.Calendar.MILLISECOND, 0)
+        val timeBytes = sportsSinceTimeBytes?.copyOf() ?: run {
+            val summaryTime = summaryEpoch
+                ?: throw IllegalStateException("Нет времени тренировки для запроса GPS details")
+            val workoutStart = java.util.Calendar.getInstance(
+                java.util.TimeZone.getTimeZone("UTC")
+            ).apply {
+                timeInMillis = summaryTime * 1000L
             }
-            huamiTimeBytes(fallback)
+            huamiTimeBytes(workoutStart)
         }
         Log.i(
             TAG,
-            "details date source=summary-request-lower-bound " +
+            "details date source=watch-workout-start " +
                 "summaryEpoch=$summaryEpoch watchBytes=${sportsSinceTimeBytes?.let { HuamiBleProtocol.hex(it) }} " +
                 "requestBytes=${HuamiBleProtocol.hex(timeBytes)}"
         )
