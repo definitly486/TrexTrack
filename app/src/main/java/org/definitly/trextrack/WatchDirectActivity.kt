@@ -753,7 +753,7 @@ class WatchDirectActivity : Activity() {
 
             when (uuid) {
                 HuamiBleProtocol.CHAR_AUTH -> handleAuthNotification(g, value)
-                HuamiBleProtocol.CHAR_ACTIVITY_CONTROL -> handleActivityControlEndpoint(g, value)
+                HuamiBleProtocol.CHAR_ACTIVITY_CONTROL -> handleActivityControlResponse(g, value)
                 HuamiBleProtocol.CHAR_ACTIVITY_DATA -> handleActivityData(value)
                 HuamiBleProtocol.CHAR_CHUNKED_2021_READ -> handleChunked2021Notify(g, value)
                 HuamiBleProtocol.CHAR_ZEPP_FT_RECV -> {
@@ -1286,10 +1286,10 @@ class WatchDirectActivity : Activity() {
     }
 
     /**
-     * Endpoint 0x004b — activity/sports fetch control metadata (same opcodes as classic).
+     * Response from the classic ACTIVITY_CONTROL GATT characteristic.
      */
     @SuppressLint("MissingPermission")
-    private fun handleActivityControlEndpoint(g: BluetoothGatt, payload: ByteArray) {
+    private fun handleActivityControlResponse(g: BluetoothGatt, payload: ByteArray) {
         Log.i(TAG, "activity control meta: ${HuamiBleProtocol.hex(payload)}")
         if (payload.size < 3) return
         if (payload[0] != 0x10.toByte()) {
@@ -1904,7 +1904,7 @@ class WatchDirectActivity : Activity() {
         private const val CHUNKED2021_ENDPOINT_AUTH: Short = 0x0082
         /** HTTP proxy (watch → phone). */
         private const val CHUNKED2021_ENDPOINT_HTTP: Short = 0x0001
-        /** Activity / sports fetch control (ZeppOsActivityFetchService). */
+        /** Legacy chunked endpoint; not used for T-Rex 2 recorded workout fetching. */
         private const val CHUNKED2021_ENDPOINT_ACTIVITY: Short = 0x004b
         /** Service list (ZeppOsServicesService). */
         private const val CHUNKED2021_ENDPOINT_SERVICES: Short = 0x0000
