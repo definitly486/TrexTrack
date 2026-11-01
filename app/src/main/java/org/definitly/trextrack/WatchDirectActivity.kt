@@ -1432,7 +1432,10 @@ class WatchDirectActivity : Activity() {
             finishLoadWithSummary(true, "Summary: $desc")
         } else {
             // details
-            val points = if (raw.isNotEmpty()) HuamiGpsDetailsParser.parse(raw) else emptyList()
+            val workoutStartMs = lastParsedSummary?.startTimestampSec?.times(1000L) ?: 0L
+            val points = if (raw.isNotEmpty()) {
+                HuamiGpsDetailsParser.parse(raw, workoutStartMs)
+            } else emptyList()
             lastGpsPoints = points
             val summaryLine = lastParsedSummary?.shortDescription() ?: "—"
             var gpxFileName: String? = null
