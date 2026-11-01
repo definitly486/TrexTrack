@@ -647,8 +647,7 @@ class WatchDirectActivity : Activity() {
                             HuamiBleProtocol.CHAR_ZEPP_FT_RECV -> " ZEPP_FT_R"
                             else -> ""
                         }
-                        sb.append("    ${c.uuid.toString().take(8)}… [$props]$name\n")
-                    }
+                        sb.append("    ${c.uuid.toString().take(8)}… [$props]$name\n")                    }
                 }
                 servicesView.text = if (sb.isEmpty()) "Сервисы не найдены" else sb.toString()
                 val hasHuami = discoveredServices.any {
@@ -1297,8 +1296,7 @@ class WatchDirectActivity : Activity() {
                     sportsFetchActive = true
                     writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_FETCH_DATA))
                 }
-            }
-            HuamiBleProtocol.CMD_FETCH_DATA -> {
+            }            HuamiBleProtocol.CMD_FETCH_DATA -> {
                 Log.i(TAG, "FETCH_DATA meta status=${payload[2]}")
                 if (payload[2] != HuamiBleProtocol.AUTH_SUCCESS) {
                     finishLoadWithSummary(true, "FETCH_DATA fail status=${payload[2]}")
@@ -1306,8 +1304,10 @@ class WatchDirectActivity : Activity() {
                 // data packets arrive on ACTIVITY_DATA characteristic
             }
             HuamiBleProtocol.CMD_ACK_ACTIVITY -> {
-                Log.i(TAG, "ACK meta")
-                finishSportsFetch("ACK")
+                // This is the watch's reply to our ACK, not a request to finish
+                // the current transfer. Processing it as data completion replays
+                // the same summary and queues duplicate 0x06 details requests.
+                Log.i(TAG, "ACK meta (confirmation only); ignore")
             }
             else -> Log.w(TAG, "unknown activity meta cmd=0x${"%02x".format(payload[1])}")
         }
