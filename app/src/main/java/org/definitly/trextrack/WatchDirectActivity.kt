@@ -1376,8 +1376,7 @@ class WatchDirectActivity : Activity() {
             // Chain GPS details if we got a summary with a usable time
             val g = gatt
             if (g != null && raw.isNotEmpty() && (parsed?.hasGps == true || sportsSinceCal != null)) {
-                runOnUiThread { setStatus("Summary OK. Запрос GPS details…
-$desc") }
+                runOnUiThread { setStatus("Summary OK. Запрос GPS details…\n$desc") }
                 handler.postDelayed({ requestSportsDetails(g) }, 500)
                 return
             }
@@ -1400,19 +1399,15 @@ $desc") }
                 }
             }
             val note = buildString {
-                append("Summary: ").append(summaryLine).append('
-')
+                append("Summary: ").append(summaryLine).append('\n')
                 append("GPS points: ").append(points.size)
                 if (points.isNotEmpty()) {
                     val first = points.first()
                     val last = points.last()
-                    append("
-First: %.5f, %.5f".format(first.latitude, first.longitude))
-                    append("
-Last: %.5f, %.5f".format(last.latitude, last.longitude))
+                    append("\nFirst: %.5f, %.5f".format(first.latitude, first.longitude))
+                    append("\nLast: %.5f, %.5f".format(last.latitude, last.longitude))
                 }
-                if (gpxPath != null) append("
-GPX: ").append(gpxPath)
+                if (gpxPath != null) append("\nGPX: ").append(gpxPath)
             }
             finishLoadWithSummary(true, note)
         }
