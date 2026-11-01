@@ -1536,7 +1536,7 @@ class WatchDirectActivity : Activity() {
         cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
         cmd[1] = 0x06 // SPORTS_DETAILS
         System.arraycopy(timeBytes, 0, cmd, 2, timeBytes.size)
-        Log.i(TAG, "request sports DETAILS cmd=${HuamiBleProtocol.hex(cmd)} since=${since.time}")
+        Log.i(TAG, "request sports DETAILS cmd=${HuamiBleProtocol.hex(cmd)}")
         runOnUiThread { setStatus("Запрос GPS details…") }
         writeActivityControl(g, cmd)
 
