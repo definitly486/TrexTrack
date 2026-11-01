@@ -108,6 +108,8 @@ class WatchDirectActivity : Activity() {
     private val gattWriteQueue = ArrayDeque<Pair<BluetoothGattCharacteristic, ByteArray>>()
     private var gattWriteInFlight = false
     private var negotiatedMtu: Int = 23
+    private val supportedEndpoints = mutableSetOf<Short>()
+    private var activityEndpointEncrypted = true
 
     // Sports summary fetch (endpoint 0x004b)
     private var sportsFetchActive = false
@@ -957,12 +959,72 @@ class WatchDirectActivity : Activity() {
             CHUNKED2021_ENDPOINT_AUTH -> handleAuthEndpoint(g, payload)
             CHUNKED2021_ENDPOINT_HTTP -> handleHttpEndpoint(g, payload)
             CHUNKED2021_ENDPOINT_ACTIVITY -> handleActivityControlEndpoint(g, payload)
+            CHUNKED2021_ENDPOINT_SERVICES -> handleServicesEndpoint(g, payload)
+            CHUNKED2021_ENDPOINT_CONNECTION -> handleConnectionEndpoint(g, payload)
             else -> {
                 Log.d(TAG, "endpoint 0x${"%04x".format(type.toInt())} len=${payload.size} " +
                     HuamiBleProtocol.hex(payload.copyOf(minOf(24, payload.size))))
                 activityBytesReceived += payload.size
                 activityBuffer.add(payload.copyOf())
             }
+        }
+    }
+
+    /** Endpoint 0x0015 — ping/pong and MTU announce. */
+    @SuppressLint("MissingPermission")
+    private fun handleConnectionEndpoint(g: BluetoothGatt, payload: ByteArray) {
+        if (payload.isEmpty()) return
+        when (payload[0]) {
+            0x03.toByte() -> {
+                Log.i(TAG, "connection PING → PONG")
+                writeChunked(g, CHUNKED2021_ENDPOINT_CONNECTION, byteArrayOf(0x04), encrypt = true)
+            }
+            0x02.toByte() -> {
+                if (payload.size >= 3) {
+                    val mtu = ((payload[1].toInt() and 0xff) or ((payload[2].toInt() and 0xff) shl 8)) + 3
+                    negotiatedMtu = mtu
+                    chunkedEncoder?.setMtu(mtu)
+                    Log.i(TAG, "connection MTU announce: $mtu")
+                }
+            }
+            else -> Log.d(TAG, "connection cmd=0x${"%02x".format(payload[0])}")
+        }
+    }
+
+    /** Endpoint 0x0000 — list of supported Zepp OS services. */
+    @SuppressLint("MissingPermission")
+    private fun handleServicesEndpoint(g: BluetoothGatt, payload: ByteArray) {
+        if (payload.isEmpty()) return
+        if (payload[0] != 0x04.toByte()) {
+            Log.w(TAG, "services unexpected cmd=0x${"%02x".format(payload[0])}")
+            return
+        }
+        if (payload.size < 3) return
+        val num = (payload[1].toInt() and 0xff) or ((payload[2].toInt() and 0xff) shl 8)
+        Log.i(TAG, "Zepp OS services count=$num")
+        supportedEndpoints.clear()
+        activityEndpointEncrypted = true
+        var i = 3
+        repeat(num) {
+            if (i + 3 > payload.size) return@repeat
+            val ep = ((payload[i].toInt() and 0xff) or ((payload[i + 1].toInt() and 0xff) shl 8)).toShort()
+            val encFlag = payload[i + 2].toInt() and 0xff
+            i += 3
+            supportedEndpoints.add(ep)
+            Log.d(TAG, "  service 0x${"%04x".format(ep.toInt())} enc=$encFlag")
+            if (ep == CHUNKED2021_ENDPOINT_ACTIVITY) {
+                activityEndpointEncrypted = encFlag != 0
+            }
+        }
+        val hasActivity = supportedEndpoints.contains(CHUNKED2021_ENDPOINT_ACTIVITY)
+        Log.i(TAG, "has activity 0x004b=$hasActivity encrypted=$activityEndpointEncrypted")
+        runOnUiThread { setStatus("Сервисы: $num, activity=$hasActivity — sports…") }
+        if (hasActivity) {
+            requestSportsSummaries(g)
+        } else {
+            // Still try activity fetch — some firmwares omit listing
+            Log.w(TAG, "0x004b not in list, trying sports anyway")
+            requestSportsSummaries(g)
         }
     }
 
@@ -1019,9 +1081,9 @@ class WatchDirectActivity : Activity() {
         } else if (response == 0x10.toByte() && step == 0x05.toByte() && status == 0x01.toByte()) {
             authState = HuamiBleProtocol.AuthState.AUTHENTICATED
             zeppAuthInProgress = false
-            runOnUiThread { setStatus("Zepp OS auth: успех! Запрос sports…", ok = true) }
+            runOnUiThread { setStatus("Zepp OS auth: успех! Запрос списка сервисов…", ok = true) }
             Log.i(TAG, "Zepp OS ECDH auth SUCCESS")
-            handler.post { requestSportsSummaries(g) }
+            handler.post { requestZeppServices(g) }
         } else if (response == 0x10.toByte() && step == 0x05.toByte() && status == 0x25.toByte()) {
             zeppAuthInProgress = false
             authState = HuamiBleProtocol.AuthState.FAILED
@@ -1083,12 +1145,12 @@ class WatchDirectActivity : Activity() {
                 expectedSportsBytes = expected
                 if (expected == 0) {
                     // ACK and finish — no workouts
-                    writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY), encrypt = true)
+                    writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY), encrypt = activityEndpointEncrypted)
                     finishLoadWithSummary(true, "Нет sports summary с указанной даты (0 байт)")
                 } else {
                     runOnUiThread { setStatus("Sports: ждут $expected байт, FETCH_DATA…") }
                     sportsFetchActive = true
-                    writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_FETCH_DATA), encrypt = true)
+                    writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_FETCH_DATA), encrypt = activityEndpointEncrypted)
                 }
             }
             HuamiBleProtocol.CMD_FETCH_DATA -> {
@@ -1119,6 +1181,22 @@ class WatchDirectActivity : Activity() {
         )
     }
 
+    /** After auth: request supported service list (endpoint 0x0000, unencrypted). */
+    @SuppressLint("MissingPermission")
+    private fun requestZeppServices(g: BluetoothGatt) {
+        Log.i(TAG, "request Zepp OS services list (0x0000 CMD_GET_LIST)")
+        runOnUiThread { setStatus("Запрос списка Zepp OS сервисов…") }
+        // Services service is not encrypted in Gadgetbridge
+        writeChunked(g, CHUNKED2021_ENDPOINT_SERVICES, byteArrayOf(0x03), encrypt = false)
+        // Fallback: if no services reply, still try sports after delay
+        handler.postDelayed({
+            if (loadInProgress && !finishPosted && supportedEndpoints.isEmpty()) {
+                Log.w(TAG, "no services list reply, trying sports anyway")
+                requestSportsSummaries(g)
+            }
+        }, 5_000)
+    }
+
     /**
      * Request sports summaries (type 0x05) since 30 days ago via Zepp OS endpoint 0x004b.
      */
@@ -1142,9 +1220,9 @@ class WatchDirectActivity : Activity() {
         cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
         cmd[1] = 0x05 // SPORTS_SUMMARIES
         System.arraycopy(timeBytes, 0, cmd, 2, timeBytes.size)
-        Log.i(TAG, "request sports summaries cmd=${HuamiBleProtocol.hex(cmd)}")
+        Log.i(TAG, "request sports summaries cmd=${HuamiBleProtocol.hex(cmd)} encrypt=$activityEndpointEncrypted")
         runOnUiThread { setStatus("Запрос sports summaries (30 дней)…") }
-        writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, cmd, encrypt = true)
+        writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, cmd, encrypt = activityEndpointEncrypted)
 
         handler.postDelayed({
             if (loadInProgress && !finishPosted) {
@@ -1178,7 +1256,7 @@ class WatchDirectActivity : Activity() {
         // ACK if we got something
         gatt?.let { g ->
             if (raw.isNotEmpty()) {
-                writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY), encrypt = true)
+                writeChunked(g, CHUNKED2021_ENDPOINT_ACTIVITY, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY), encrypt = activityEndpointEncrypted)
             }
         }
         finishLoadWithSummary(true, note)
@@ -1481,5 +1559,9 @@ class WatchDirectActivity : Activity() {
         private const val CHUNKED2021_ENDPOINT_HTTP: Short = 0x0001
         /** Activity / sports fetch control (ZeppOsActivityFetchService). */
         private const val CHUNKED2021_ENDPOINT_ACTIVITY: Short = 0x004b
+        /** Service list (ZeppOsServicesService). */
+        private const val CHUNKED2021_ENDPOINT_SERVICES: Short = 0x0000
+        /** Connection ping/pong (ZeppOsConnectionService). */
+        private const val CHUNKED2021_ENDPOINT_CONNECTION: Short = 0x0015
     }
 }
