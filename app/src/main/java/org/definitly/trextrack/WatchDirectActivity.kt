@@ -1508,31 +1508,26 @@ class WatchDirectActivity : Activity() {
         sportsFetchType = 0x06
         finishPosted = false
 
-        // Gadgetbridge uses the timestamp returned by the watch's START_DATE
-        // response as the start time for the details operation. Preserve the
-        // watch-provided timezone instead of converting the protobuf epoch through
-        // the phone timezone (which shifted 01:46 to 04:46 on this T-Rex 2).
+        // Match Gadgetbridge's FetchSportsDetailsOperation: it takes the summary's
+        // Unix start time, creates a device-local Calendar, then HuamiSupport.getTimeBytes()
+        // serializes year/month/day/hour/minute plus reason=0 and the local TZ quarter-hours.
+        // The START_DATE response's final two bytes are not a ready-to-send request tail:
+        // its timestamp is UTC, while the details request must use the local Calendar.
         val summaryEpoch = lastParsedSummary?.startTimestampSec
-        val watchTimeBytes = sportsSinceTimeBytes?.copyOf()
-        val timeBytes = if (watchTimeBytes != null && watchTimeBytes.size >= 8) {
-            watchTimeBytes.copyOfRange(0, 8).also {
-                it[6] = 0 // Gadgetbridge fetches sports details with minute precision.
+        val requestCalendar = summaryEpoch?.let { sec ->
+            java.util.Calendar.getInstance().apply {
+                timeInMillis = sec * 1000L
             }
-        } else {
-            val fallback = summaryEpoch?.let { sec ->
-                java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")).apply {
-                    timeInMillis = sec * 1000L
-                }
-            } ?: sportsSinceCal ?: java.util.Calendar.getInstance().apply {
-                add(java.util.Calendar.DAY_OF_YEAR, -30)
-            }
-            huamiTimeBytes(fallback)
+        } ?: sportsSinceCal ?: java.util.Calendar.getInstance().apply {
+            add(java.util.Calendar.DAY_OF_YEAR, -30)
         }
+        val timeBytes = huamiTimeBytes(requestCalendar)
         Log.i(
             TAG,
-            "details date source=${if (watchTimeBytes != null) "watch-response" else "fallback"} " +
-                "summaryEpoch=$summaryEpoch watchBytes=${watchTimeBytes?.let { HuamiBleProtocol.hex(it) }} " +
-                "requestBytes=${HuamiBleProtocol.hex(timeBytes)}"
+            "details date source=${if (summaryEpoch != null) "summary-local-calendar" else "fallback-calendar"} " +
+                "summaryEpoch=$summaryEpoch watchBytes=${sportsSinceTimeBytes?.let { HuamiBleProtocol.hex(it) }} " +
+                "requestBytes=${HuamiBleProtocol.hex(timeBytes)} " +
+                "calendar=${requestCalendar.time} tz=${requestCalendar.timeZone.id}"
         )
         val cmd = ByteArray(2 + timeBytes.size)
         cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
