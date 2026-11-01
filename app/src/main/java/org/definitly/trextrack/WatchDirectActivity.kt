@@ -107,6 +107,7 @@ class WatchDirectActivity : Activity() {
     private var zeppAuthInProgress = false
     private val gattWriteQueue = ArrayDeque<Pair<BluetoothGattCharacteristic, ByteArray>>()
     private var gattWriteInFlight = false
+    private var negotiatedMtu: Int = 23
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -538,6 +539,16 @@ class WatchDirectActivity : Activity() {
             }
         }
 
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                negotiatedMtu = mtu
+                chunkedEncoder?.setMtu(mtu)
+                Log.i(TAG, "MTU changed to $mtu")
+            } else {
+                Log.w(TAG, "onMtuChanged status=$status mtu=$mtu")
+            }
+        }
+
         @SuppressLint("MissingPermission")
         override fun onDescriptorWrite(
             g: BluetoothGatt,
@@ -783,15 +794,24 @@ class WatchDirectActivity : Activity() {
         val classic = HuamiBleProtocol.hasClassicAuth(g)
         val zepp = HuamiBleProtocol.hasZeppOsTransfer(g)
         Log.i(TAG, "beginAuth classic=$classic zepp=$zepp")
-        when {
-            zepp && !classic -> startZeppOsAuth(g)
-            classic -> startClassicAuth(g)
-            zepp -> startZeppOsAuth(g)
-            else -> {
-                setStatus("Нет AUTH / chunked 2021 — auth невозможен", error = true)
-                finishLoadWithSummary(false, "нет auth characteristics")
-            }
+        // Request larger MTU before chunked writes (default 23 is tight)
+        try {
+            g.requestMtu(512)
+        } catch (e: Exception) {
+            Log.w(TAG, "requestMtu failed", e)
         }
+        // Give the stack a moment for MTU / CCCD to settle
+        handler.postDelayed({
+            when {
+                zepp && !classic -> startZeppOsAuth(g)
+                classic -> startClassicAuth(g)
+                zepp -> startZeppOsAuth(g)
+                else -> {
+                    setStatus("Нет AUTH / chunked 2021 — auth невозможен", error = true)
+                    finishLoadWithSummary(false, "нет auth characteristics")
+                }
+            }
+        }, 400)
     }
 
     /**
@@ -808,7 +828,14 @@ class WatchDirectActivity : Activity() {
             return
         }
 
-        val enc = Huami2021ChunkedEncoder(23)
+        Log.i(
+            TAG,
+            "CH2021 write props=0x${"%02x".format(writeChar.properties)} " +
+                "read props=0x${"%02x".format(readChar.properties)}"
+        )
+
+        val currentMtu = negotiatedMtu
+        val enc = Huami2021ChunkedEncoder(currentMtu)
         val dec = Huami2021ChunkedDecoder({ type, payload ->
             handleZeppAuthPayload(g, type, payload)
         }, force2021Protocol = true)
@@ -889,13 +916,32 @@ class WatchDirectActivity : Activity() {
         if (gattWriteInFlight) return
         val next = gattWriteQueue.removeFirstOrNull() ?: return
         val (ch, value) = next
-        ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        // Prefer write-without-response when supported (typical for Huami chunked 0x0016)
+        val props = ch.properties
+        ch.writeType = when {
+            props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0 ->
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            else ->
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
         ch.value = value
         gattWriteInFlight = true
         val ok = g.writeCharacteristic(ch)
-        Log.d(TAG, "GATT write ${ch.uuid.toString().take(8)}… len=${value.size} ok=$ok queueLeft=${gattWriteQueue.size}")
+        Log.d(
+            TAG,
+            "GATT write ${ch.uuid.toString().take(8)}… len=${value.size} type=${ch.writeType} " +
+                "props=0x${"%02x".format(props)} ok=$ok queueLeft=${gattWriteQueue.size}"
+        )
         if (!ok) {
             gattWriteInFlight = false
+            return
+        }
+        // WRITE_NO_RESPONSE often does not invoke onCharacteristicWrite — advance queue ourselves
+        if (ch.writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+            handler.postDelayed({
+                gattWriteInFlight = false
+                pumpGattWriteQueue(g)
+            }, 40)
         }
     }
 

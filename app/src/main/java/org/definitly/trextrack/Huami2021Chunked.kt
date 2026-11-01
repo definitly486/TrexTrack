@@ -59,7 +59,7 @@ class Huami2021ChunkedEncoder(private var mtu: Int = 23) {
 
     /**
      * Encode [data] for endpoint [type] and call [chunkWriter] for each GATT write.
-     * [encrypt] requires session key already set (except for the initial auth pubkey frame).
+     * Framing matches Gadgetbridge Huami2021ChunkedEncoder (header_size 10/11 first chunk).
      */
     @Synchronized
     fun write(
@@ -74,14 +74,18 @@ class Huami2021ChunkedEncoder(private var mtu: Int = 23) {
             return
         }
 
+        // Gadgetbridge increments handle at the start of each logical message
+        writeHandle++
+
         var remaining = data.size
-        var length = data.size
+        val length = data.size
         var count: Byte = 0
-        var headerSize = 8
+        // First-chunk header includes length(4)+type(2): base 10, +1 if extended_flags
+        var headerSize = 10
         if (extendedFlags) headerSize++
 
         var dataToSend = data
-        if (encrypt) {
+        if (extendedFlags && encrypt) {
             val key = sharedSessionKey!!
             val messageKey = ByteArray(16)
             for (i in 0 until 16) {
@@ -114,6 +118,10 @@ class Huami2021ChunkedEncoder(private var mtu: Int = 23) {
 
         while (remaining > 0) {
             val maxChunk = calcMaxWriteChunk(mtu) - headerSize
+            if (maxChunk <= 0) {
+                Log.e(TAG, "MTU too small: mtu=$mtu header=$headerSize")
+                return
+            }
             val copyBytes = minOf(remaining, maxChunk)
             val chunk = ByteArray(copyBytes + headerSize)
 
@@ -148,6 +156,7 @@ class Huami2021ChunkedEncoder(private var mtu: Int = 23) {
             System.arraycopy(dataToSend, dataToSend.size - remaining, chunk, headerSize, copyBytes)
             chunkWriter(chunk)
             remaining -= copyBytes
+            // Subsequent chunks: only flags+handle+count (+ext)
             headerSize = 4
             if (extendedFlags) headerSize++
             count++
