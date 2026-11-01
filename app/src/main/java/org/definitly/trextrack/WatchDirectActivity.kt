@@ -113,11 +113,7 @@ class WatchDirectActivity : Activity() {
     private var gattWriteInFlight = false
     private var negotiatedMtu: Int = 23
     private val supportedEndpoints = mutableSetOf<Short>()
-    private var activityEndpointEncrypted = true
-    /** true → write sports cmds via 0x004b; false → classic CHAR_ACTIVITY_CONTROL */
-    private var useChunkedActivityFetch = false
-
-    // Sports summary fetch (endpoint 0x004b)
+    // Sports summary fetch through the classic ACTIVITY_CONTROL / ACTIVITY_DATA GATT characteristics
     private var sportsFetchActive = false
     private var expectedSportsBytes = -1
     private var sportsPacketCounter: Byte = -1
@@ -1182,7 +1178,6 @@ class WatchDirectActivity : Activity() {
         val num = (payload[1].toInt() and 0xff) or ((payload[2].toInt() and 0xff) shl 8)
         Log.i(TAG, "Zepp OS services count=$num")
         supportedEndpoints.clear()
-        activityEndpointEncrypted = true
         var i = 3
         repeat(num) {
             if (i + 3 > payload.size) return@repeat
@@ -1191,15 +1186,11 @@ class WatchDirectActivity : Activity() {
             i += 3
             supportedEndpoints.add(ep)
             Log.d(TAG, "  service 0x${"%04x".format(ep.toInt())} enc=$encFlag")
-            if (ep == CHUNKED2021_ENDPOINT_ACTIVITY) {
-                activityEndpointEncrypted = encFlag != 0
-            }
         }
         // Gadgetbridge's T-Rex 2 implementation fetches workout summaries/details
         // through the legacy ACTIVITY_CONTROL and ACTIVITY_DATA GATT characteristics.
         // ECDH/chunked transport remains in use for authentication and other services.
         // Do not route workout fetch through the unverified 0x004b endpoint.
-        useChunkedActivityFetch = false
         Log.i(TAG, "sports fetch transport=classic ACTIVITY_CONTROL/ACTIVITY_DATA")
         runOnUiThread { setStatus("Сервисы: $num, sports via classic ACT_CTL…") }
         requestSportsSummaries(g)
