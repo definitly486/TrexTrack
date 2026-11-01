@@ -137,7 +137,9 @@ object HuamiGpsDetailsParser {
     fun toGpx(points: List<GpsPoint>, name: String = "T-Rex track"): String {
         val sb = StringBuilder()
         sb.append("""<?xml version="1.0" encoding="UTF-8"?>""").append('\n')
-        sb.append("""<gpx version="1.1" creator="TrexTrack">""").append('\n')
+        sb.append(
+            """<gpx version="1.1" creator="TrexTrack" xmlns="http://www.topografix.com/GPX/1/1">"""
+        ).append('\n')
         sb.append("<trk><name>").append(xmlEsc(name)).append("</name><trkseg>\n")
         val sdf = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).apply {
             timeZone = java.util.TimeZone.getTimeZone("UTC")
@@ -151,5 +153,10 @@ object HuamiGpsDetailsParser {
         return sb.toString()
     }
 
-    private fun xmlEsc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    private fun xmlEsc(s: String) = s
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")
 }

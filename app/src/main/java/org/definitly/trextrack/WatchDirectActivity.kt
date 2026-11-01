@@ -84,6 +84,8 @@ class WatchDirectActivity : Activity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var fetchKeyButton: Button
     private lateinit var keyStatusView: TextView
+    private var pendingGpxContent: String? = null
+    private var pendingGpxName: String? = null
 
     // Common Huami / Zepp OS related UUIDs (informational)
     private val HUAMI_SERVICE = UUID.fromString("0000fee0-0000-1000-8000-00805f9b34fb")
@@ -258,7 +260,54 @@ class WatchDirectActivity : Activity() {
         }
     }
 
+    @Deprecated("Deprecated in Android API; retained for compatibility with minSdk 26")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_SAVE_GPX) return
+
+        val content = pendingGpxContent
+        val name = pendingGpxName ?: "trex_track.gpx"
+        pendingGpxContent = null
+        pendingGpxName = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null || content == null) {
+            setStatus("Сохранение GPX отменено")
+            return
+        }
+        try {
+            contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use {
+                it.write(content)
+            } ?: throw java.io.IOException("Не удалось открыть файл для записи")
+            setStatus("GPX сохранён: $name", ok = true)
+            Toast.makeText(this, "GPX сохранён", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Log.e(TAG, "GPX export failed", e)
+            setStatus("Ошибка сохранения GPX: ${e.message}", error = true)
+            Toast.makeText(this, "Не удалось сохранить GPX: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun saveGpxToUserStorage(content: String, fileName: String) {
+        pendingGpxContent = content
+        pendingGpxName = fileName
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/gpx+xml"
+            putExtra(Intent.EXTRA_TITLE, fileName)
+        }
+        try {
+            startActivityForResult(intent, REQ_SAVE_GPX)
+        } catch (e: Exception) {
+            pendingGpxContent = null
+            pendingGpxName = null
+            Log.e(TAG, "Unable to open document picker", e)
+            setStatus("Не удалось открыть выбор файла: ${e.message}", error = true)
+        }
+    }
+
     override fun onDestroy() {
+        pendingGpxContent = null
+        pendingGpxName = null
         stopScan()
         disconnectGatt()
         super.onDestroy()
@@ -1317,8 +1366,8 @@ class WatchDirectActivity : Activity() {
         writeActivityControl(g, cmd)
 
         handler.postDelayed({
-            if (loadInProgress && !finishPosted) {
-                finishSportsFetch("timeout")
+            if (loadInProgress && !finishPosted && sportsFetchType == 0x05.toByte()) {
+                finishSportsFetch("timeout-summaries")
             }
         }, 20_000)
     }
@@ -1386,17 +1435,15 @@ class WatchDirectActivity : Activity() {
             val points = if (raw.isNotEmpty()) HuamiGpsDetailsParser.parse(raw) else emptyList()
             lastGpsPoints = points
             val summaryLine = lastParsedSummary?.shortDescription() ?: "—"
-            var gpxPath: String? = null
+            var gpxFileName: String? = null
             if (points.isNotEmpty()) {
-                try {
-                    val dir = getExternalFilesDir(null) ?: filesDir
-                    val f = java.io.File(dir, "trex_track_${System.currentTimeMillis()}.gpx")
-                    f.writeText(HuamiGpsDetailsParser.toGpx(points, summaryLine))
-                    gpxPath = f.absolutePath
-                    Log.i(TAG, "GPX written: $gpxPath (${points.size} pts)")
-                } catch (e: Exception) {
-                    Log.e(TAG, "GPX write failed", e)
-                }
+                val stamp = lastParsedSummary?.startTimestampSec
+                    ?.let { java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date(it * 1000L)) }
+                    ?: java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
+                gpxFileName = "trex_track_${stamp}.gpx"
+                val gpx = HuamiGpsDetailsParser.toGpx(points, summaryLine)
+                Log.i(TAG, "GPX ready for export: $gpxFileName (${points.size} pts)")
+                runOnUiThread { saveGpxToUserStorage(gpx, gpxFileName!!) }
             }
             val note = buildString {
                 append("Summary: ").append(summaryLine).append('\n')
@@ -1407,7 +1454,7 @@ class WatchDirectActivity : Activity() {
                     append("\nFirst: %.5f, %.5f".format(first.latitude, first.longitude))
                     append("\nLast: %.5f, %.5f".format(last.latitude, last.longitude))
                 }
-                if (gpxPath != null) append("\nGPX: ").append(gpxPath)
+                if (gpxFileName != null) append("\nGPX: ").append(gpxFileName).append(" (выберите папку для сохранения)")
             }
             finishLoadWithSummary(true, note)
         }
@@ -1443,9 +1490,21 @@ class WatchDirectActivity : Activity() {
         sportsFetchType = 0x06
         finishPosted = false
 
-        val since = sportsSinceCal ?: lastParsedSummary?.startTimestampSec?.let { sec ->
+        // The metadata response contains a pagination cursor, not necessarily the
+        // workout's start time. Prefer the timestamp inside WorkoutSummary; using the
+        // cursor here can shift the details request away from the selected workout.
+        val summaryEpoch = lastParsedSummary?.startTimestampSec
+        val cursorEpoch = sportsSinceCal?.timeInMillis?.div(1000L)
+        val since = summaryEpoch?.let { sec ->
             java.util.Calendar.getInstance().apply { timeInMillis = sec * 1000L }
-        } ?: java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, -30) }
+        } ?: sportsSinceCal ?: java.util.Calendar.getInstance().apply {
+            add(java.util.Calendar.DAY_OF_YEAR, -30)
+        }
+        Log.i(
+            TAG,
+            "details date source=${if (summaryEpoch != null) "summary" else "cursor/fallback"} " +
+                "summaryEpoch=$summaryEpoch cursorEpoch=$cursorEpoch deltaSec=${if (summaryEpoch != null && cursorEpoch != null) summaryEpoch - cursorEpoch else "n/a"}"
+        )
 
         val timeBytes = huamiTimeBytes(since)
         val cmd = ByteArray(2 + timeBytes.size)
@@ -1754,6 +1813,7 @@ class WatchDirectActivity : Activity() {
     companion object {
         private const val TAG = "WatchDirect"
         private const val REQ_BLE = 2001
+        private const val REQ_SAVE_GPX = 2002
         /** Huami 2021 chunked endpoint for authentication (InitOperation2021). */
         private const val CHUNKED2021_ENDPOINT_AUTH: Short = 0x0082
         /** HTTP proxy (watch → phone). */
