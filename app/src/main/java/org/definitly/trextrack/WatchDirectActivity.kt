@@ -131,6 +131,13 @@ class WatchDirectActivity : Activity() {
     private var lastParsedSummary: ParsedWorkoutSummary? = null
     private var lastGpsPoints: List<GpsPoint> = emptyList()
 
+    /** How many workouts fetched in this session (safety cap). */
+    private var sportsFetchedCount = 0
+    private val MAX_SPORTS_PER_SESSION = 15
+
+    /** Current lower-bound for the next summary request. Advanced after each workout. */
+    private var currentSportsLowerBound: java.util.Calendar? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -912,6 +919,11 @@ class WatchDirectActivity : Activity() {
         finishPosted = false
         zeppAuthInProgress = false
         sessionAesKey = null
+        // Fresh sports multi-fetch session
+        sportsFetchedCount = 0
+        currentSportsLowerBound = null
+        lastParsedSummary = null
+        lastGpsPoints = emptyList()
         loadTracksButton.isEnabled = false
 
         setStatus(
@@ -1471,9 +1483,17 @@ class WatchDirectActivity : Activity() {
                 if (expected == 0) {
                     writeActivityControl(g, byteArrayOf(HuamiBleProtocol.CMD_ACK_ACTIVITY, 0x09))
                     if (sportsFetchType == 0x05.toByte()) {
-                        finishLoadWithSummary(true, "Нет sports summary с указанной даты (0 байт)")
+                        // No more summaries after current lower-bound → done
+                        Log.i(TAG, "no more sports summaries (expected=0)")
+                        finishLoadWithSummary(
+                            true,
+                            if (sportsFetchedCount == 0) "Нет sports summary с указанной даты (0 байт)"
+                            else "Готово. Выгружено тренировок: $sportsFetchedCount"
+                        )
                     } else {
-                        finishLoadWithSummary(true, "Нет GPS details (0 байт). Summary: ${lastParsedSummary?.shortDescription()}")
+                        // Details empty (already synced/deleted) — still advance to next workout
+                        Log.i(TAG, "details length=0 for current workout — advancing to next")
+                        advanceLowerBoundAndContinue(g)
                     }
                 } else {
                     runOnUiThread {
@@ -1559,17 +1579,29 @@ class WatchDirectActivity : Activity() {
         sportsSinceTimeBytes = null
         sportsSinceCal = null
 
-        val since = java.util.Calendar.getInstance().apply {
-            add(java.util.Calendar.DAY_OF_YEAR, -30)
-            set(java.util.Calendar.SECOND, 0)
-            set(java.util.Calendar.MILLISECOND, 0)
+        // First call of a session: reset counter. Subsequent calls keep currentSportsLowerBound.
+        if (currentSportsLowerBound == null) {
+            sportsFetchedCount = 0
         }
+        // Use advanced bound if we already fetched something; otherwise 30 days ago.
+        val since = (currentSportsLowerBound?.clone() as java.util.Calendar?)
+            ?: java.util.Calendar.getInstance().apply {
+                add(java.util.Calendar.DAY_OF_YEAR, -30)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+        currentSportsLowerBound = since.clone() as java.util.Calendar
+
         val timeBytes = huamiTimeBytes(since)
         // Gadgetbridge's summary and details operations share lastSportsActivityTimeMillis.
         // Save the exact lower bound so type 0x06 uses the same timestamp, not the
         // watch's returned last-activity timestamp from the START_DATE response.
         sportsFetchSinceTimeBytes = timeBytes.copyOf()
-        Log.i(TAG, "sports sync lower-bound=${HuamiBleProtocol.hex(sportsFetchSinceTimeBytes!!)}")
+        Log.i(
+            TAG,
+            "sports sync lower-bound=${HuamiBleProtocol.hex(sportsFetchSinceTimeBytes!!)} " +
+                "(fetched so far=$sportsFetchedCount)"
+        )
         // 0x01 = START_DATE, 0x05 = SPORTS_SUMMARIES
         val cmd = ByteArray(2 + timeBytes.size)
         cmd[0] = HuamiBleProtocol.CMD_ACTIVITY_START_DATE
@@ -1580,7 +1612,9 @@ class WatchDirectActivity : Activity() {
             "request sports summaries cmd=${HuamiBleProtocol.hex(cmd)} " +
                 "via=classic ACTIVITY_CONTROL"
         )
-        runOnUiThread { setStatus("Запрос sports summaries (30 дней)…") }
+        runOnUiThread {
+            setStatus("Запрос sports summaries (bound ${since.time}, #$sportsFetchedCount)…")
+        }
         writeActivityControl(g, cmd)
 
         handler.postDelayed({
@@ -1678,8 +1712,50 @@ class WatchDirectActivity : Activity() {
                 }
                 if (gpxFileName != null) append("\nGPX: ").append(gpxFileName).append(" (выберите папку для сохранения)")
             }
-            finishLoadWithSummary(true, note)
+            runOnUiThread { setStatus(note) }
+            // Advance lower-bound and try the next workout (if any)
+            gatt?.let { advanceLowerBoundAndContinue(it) }
+                ?: finishLoadWithSummary(true, note)
         }
+    }
+
+    /**
+     * After a workout (summary+details, even if details were empty), advance the
+     * lower-bound past this workout and request the next summary.
+     * Matches Gadgetbridge's needsAnotherFetch / lastSportsActivityTimeMillis pattern.
+     */
+    @SuppressLint("MissingPermission")
+    private fun advanceLowerBoundAndContinue(g: BluetoothGatt) {
+        sportsFetchedCount++
+
+        val summary = lastParsedSummary
+        if (summary == null) {
+            Log.w(TAG, "advanceLowerBound: no summary")
+            finishLoadWithSummary(true, "Выгружено: $sportsFetchedCount (нет summary для продолжения)")
+            return
+        }
+
+        // Start of this workout + 1 minute so the watch does not return the same record.
+        val nextBound = java.util.Calendar.getInstance().apply {
+            timeInMillis = summary.startTimestampSec * 1000L
+            add(java.util.Calendar.MINUTE, 1)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+        currentSportsLowerBound = nextBound
+        Log.i(TAG, "advanced lower-bound to ${nextBound.time} (fetched=$sportsFetchedCount)")
+
+        if (sportsFetchedCount >= MAX_SPORTS_PER_SESSION) {
+            Log.i(TAG, "reached MAX_SPORTS_PER_SESSION=$MAX_SPORTS_PER_SESSION")
+            finishLoadWithSummary(true, "Достигнут лимит $MAX_SPORTS_PER_SESSION тренировок за сессию")
+            return
+        }
+
+        handler.postDelayed({
+            if (loadInProgress && !finishPosted) {
+                requestSportsSummaries(g)
+            }
+        }, 400)
     }
 
     private fun calendarFromHuamiBytes(payload: ByteArray, offset: Int): java.util.Calendar {
