@@ -133,7 +133,7 @@ class WatchDirectActivity : Activity() {
 
     /** How many workouts fetched in this session (safety cap). */
     private var sportsFetchedCount = 0
-    private val MAX_SPORTS_PER_SESSION = 15
+    private val MAX_SPORTS_PER_SESSION = 100
 
     /** Current lower-bound for the next summary request. Advanced after each workout. */
     private var currentSportsLowerBound: java.util.Calendar? = null
