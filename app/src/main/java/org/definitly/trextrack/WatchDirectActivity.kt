@@ -1736,8 +1736,14 @@ class WatchDirectActivity : Activity() {
         }
 
         // Start of this workout + 1 minute so the watch does not return the same record.
+        val startSec = summary.startTimestampSec
+        if (startSec == null) {
+            Log.w(TAG, "advanceLowerBound: summary has no startTimestampSec")
+            finishLoadWithSummary(true, "Выгружено: $sportsFetchedCount (нет времени старта)")
+            return
+        }
         val nextBound = java.util.Calendar.getInstance().apply {
-            timeInMillis = summary.startTimestampSec * 1000L
+            timeInMillis = startSec * 1000L
             add(java.util.Calendar.MINUTE, 1)
             set(java.util.Calendar.SECOND, 0)
             set(java.util.Calendar.MILLISECOND, 0)
