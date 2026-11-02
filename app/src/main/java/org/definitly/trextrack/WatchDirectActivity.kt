@@ -1266,26 +1266,166 @@ class WatchDirectActivity : Activity() {
     }
 
     /**
-     * Endpoint 0x0001 — watch asks phone to HTTP GET Huami APIs.
-     * Reply "no internet" so the watch does not wait.
+     * Zepp OS HTTP proxy (endpoint 0x0001): the watch delegates Huami API
+     * requests to the phone. Keep this separate from the account/cloud login
+     * repository — these are requests initiated by the authenticated watch.
      */
     @SuppressLint("MissingPermission")
     private fun handleHttpEndpoint(g: BluetoothGatt, payload: ByteArray) {
-        if (payload.isEmpty()) return
-        Log.i(TAG, "HTTP endpoint cmd=0x${"%02x".format(payload[0])} len=${payload.size}")
-        if (payload[0] == 0x01.toByte() && payload.size >= 2) {
-            // CMD_SIMPLE_REQUEST: requestId at [1]
-            val requestId = payload[1].toInt() and 0xff
-            // CMD_SIMPLE_RESPONSE, requestId, RESPONSE_NO_INTERNET=0x02, 4 zero bytes
-            val reply = byteArrayOf(0x02, requestId.toByte(), 0x02, 0, 0, 0, 0)
-            Log.i(TAG, "HTTP reply no-internet id=$requestId")
-            writeChunked(g, CHUNKED2021_ENDPOINT_HTTP, reply, encrypt = true)
-        } else if (payload[0] == 0x03.toByte() && payload.size >= 2) {
-            val requestId = payload[1].toInt() and 0xff
-            // raw download — also refuse
-            val reply = byteArrayOf(0x02, requestId.toByte(), 0x02, 0, 0, 0, 0)
-            writeChunked(g, CHUNKED2021_ENDPOINT_HTTP, reply, encrypt = true)
+        if (payload.size < 2) return
+        val command = payload[0].toInt() and 0xff
+        val requestId = payload[1].toInt() and 0xff
+        Log.i(TAG, "HTTP endpoint cmd=0x${"%02x".format(command)} len=${payload.size} id=$requestId")
+        if (command != 0x01 && command != 0x03) {
+            Log.w(TAG, "Unsupported HTTP endpoint command=0x${"%02x".format(command)}")
+            return
         }
+
+        val fields = parseWatchHttpRequest(payload, 2)
+        val method = fields.first
+        val urlString = fields.second
+        val headers = fields.third
+        if (method.isNullOrBlank() || urlString.isNullOrBlank()) {
+            Log.w(TAG, "HTTP request $requestId has no method/URL; returning no-internet")
+            replyHttpNoInternet(g, requestId)
+            return
+        }
+
+        val url = try { java.net.URL(urlString) } catch (e: Exception) {
+            Log.w(TAG, "HTTP request $requestId has invalid URL", e)
+            replyHttpNoInternet(g, requestId)
+            return
+        }
+        val host = url.host.lowercase()
+        if (url.protocol != "https" ||
+            !(host == "huami.com" || host.endsWith(".huami.com") ||
+                host == "huami.net" || host.endsWith(".huami.net") ||
+                host == "amazfit.com" || host.endsWith(".amazfit.com"))) {
+            Log.w(TAG, "Blocked watch HTTP destination host=$host")
+            replyHttpNoInternet(g, requestId)
+            return
+        }
+        if (method != "GET") {
+            Log.w(TAG, "Unsupported watch HTTP method=$method host=$host")
+            replyHttpNoInternet(g, requestId)
+            return
+        }
+
+        // Do not perform network I/O on the Bluetooth callback thread.
+        scope.launch {
+            val response = try {
+                withContext(Dispatchers.IO) {
+                    performWatchHttpGet(url, headers)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Watch HTTP GET failed id=$requestId host=$host: ${e.message}")
+                null
+            }
+            if (gatt !== g || !connected) return@launch
+            if (response == null) {
+                replyHttpNoInternet(g, requestId)
+            } else {
+                replyHttpSuccess(g, requestId, response.first, response.second)
+            }
+        }
+    }
+
+    /** Decode method and URL as NUL-terminated UTF-8 strings. Remaining fields
+     * are optional newline-separated HTTP header lines. Header values are never logged. */
+    private fun parseWatchHttpRequest(
+        payload: ByteArray,
+        offset: Int
+    ): Triple<String?, String?, Map<String, String>> {
+        fun readCString(start: Int): Pair<String?, Int> {
+            if (start >= payload.size) return null to start
+            var end = start
+            while (end < payload.size && payload[end] != 0.toByte()) end++
+            val value = String(payload, start, end - start, Charsets.UTF_8)
+            return value to minOf(end + 1, payload.size)
+        }
+        val (method, afterMethod) = readCString(offset)
+        val (url, afterUrl) = readCString(afterMethod)
+        val remainder = if (afterUrl < payload.size) {
+            String(payload, afterUrl, payload.size - afterUrl, Charsets.UTF_8)
+                .trim('\u0000', '\r', '\n', ' ')
+        } else ""
+        val headers = linkedMapOf<String, String>()
+        remainder.split('\u0000', '\n').forEach { line ->
+            val separator = line.indexOf(':')
+            if (separator > 0) {
+                val name = line.substring(0, separator).trim()
+                val value = line.substring(separator + 1).trim()
+                if (name.matches(Regex("[A-Za-z0-9-]{1,64}")) &&
+                    value.length <= 4096 &&
+                    !name.equals("Host", true) &&
+                    !name.equals("Connection", true) &&
+                    !name.equals("Content-Length", true)) {
+                    headers[name] = value
+                }
+            }
+        }
+        return Triple(method?.trim(), url?.trim(), headers)
+    }
+
+    /** Execute a bounded HTTPS GET and return status + response body. */
+    private fun performWatchHttpGet(
+        url: java.net.URL,
+        headers: Map<String, String>
+    ): Pair<Int, ByteArray> {
+        val connection = (url.openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 20_000
+            instanceFollowRedirects = false
+            useCaches = false
+            setRequestProperty("Accept-Encoding", "identity")
+            headers.forEach { (name, value) -> setRequestProperty(name, value) }
+        }
+        try {
+            val status = connection.responseCode
+            val stream = if (status >= 400) connection.errorStream else connection.inputStream
+            val body = java.io.ByteArrayOutputStream()
+            stream?.use { input ->
+                val buffer = ByteArray(8192)
+                var total = 0
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    if (total > MAX_WATCH_HTTP_RESPONSE_BYTES) {
+                        throw java.io.IOException("Watch HTTP response exceeds size limit")
+                    }
+                    body.write(buffer, 0, count)
+                }
+            }
+            Log.i(TAG, "Watch HTTP response host=${url.host} status=$status bytes=${body.size()}")
+            return status to body.toByteArray()
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun replyHttpNoInternet(g: BluetoothGatt, requestId: Int) {
+        val reply = byteArrayOf(0x02, requestId.toByte(), 0x02, 0, 0, 0, 0)
+        Log.i(TAG, "HTTP reply no-internet id=$requestId")
+        writeChunked(g, CHUNKED2021_ENDPOINT_HTTP, reply, encrypt = true)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun replyHttpSuccess(g: BluetoothGatt, requestId: Int, status: Int, body: ByteArray) {
+        // Zepp OS HTTP response: CMD, request id, success, HTTP status, LE body length, body.
+        val response = java.nio.ByteBuffer.allocate(8 + body.size)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(0x02)
+            .put(requestId.toByte())
+            .put(0x01)
+            .put(status.toByte())
+            .putInt(body.size)
+            .put(body)
+            .array()
+        Log.i(TAG, "HTTP reply success id=$requestId status=$status bytes=${body.size}")
+        writeChunked(g, CHUNKED2021_ENDPOINT_HTTP, response, encrypt = true)
     }
 
     /**
@@ -1923,5 +2063,6 @@ class WatchDirectActivity : Activity() {
         private const val CHUNKED2021_ENDPOINT_SERVICES: Short = 0x0000
         /** Connection ping/pong (ZeppOsConnectionService). */
         private const val CHUNKED2021_ENDPOINT_CONNECTION: Short = 0x0015
+        private const val MAX_WATCH_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
     }
 }
