@@ -2,6 +2,8 @@ name: Android Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -71,6 +73,9 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "branch" ]]; then
+            VERSION="main-${GITHUB_RUN_NUMBER}"
+          fi
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             VERSION="${{ inputs.tag_name }}"
             if [[ -z "$VERSION" ]]; then VERSION="manual-${GITHUB_RUN_NUMBER}"; fi
