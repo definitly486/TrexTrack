@@ -33,27 +33,27 @@ Android/Kotlin starter project for a standalone GPX exporter targeting Amazfit T
 Requirements: JDK 17, Android SDK platform 35, Android Gradle Plugin 8.7.3.
 
 ```sh
-./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+./gradlew assembleRelease
 ```
 
-If the project is built on FreeBSD and Gradle/AGP rejects the host OS:
+For signed releases, configure these GitHub repository secrets:
 
-```sh
-JAVA_TOOL_OPTIONS=-Dos.name=Linux ./gradlew assembleDebug
-```
+- `TREXTRACK_KEYSTORE_BASE64` — Base64-encoded release keystore.
+- `TREXTRACK_STORE_PASSWORD`
+- `TREXTRACK_KEY_ALIAS`
+- `TREXTRACK_KEY_PASSWORD`
 
-Release signing is optional: set `TREXTRACK_STORE_FILE`, `TREXTRACK_STORE_PASSWORD`, `TREXTRACK_KEY_ALIAS`, `TREXTRACK_KEY_PASSWORD` only when you need a signed release APK.
+Without these secrets, Actions still builds and publishes the release APK, but it will be unsigned and cannot be installed as a normal update.
 
 ## CI (GitHub Actions)
 
-После каждого push workflow **Debug APK** (`.github/workflows/debug-build.yml`):
+Workflow **Android Release** builds only the release variant and publishes the APK as a normal GitHub Release (not a pre-release).
 
-1. Собирает `assembleDebug` на Ubuntu (JDK 17).
-2. Загружает APK как artifact в Actions.
-3. Публикует pre-release с тегом `debug-<branch>-<run_number>` и прикреплённым APK.
+- Push a tag matching `v*` (for example `v1.0.0`) to build and publish automatically.
+- Or run **Android Release** manually from the Actions tab.
+- The APK is attached to the GitHub Release as `TrexTrack-<tag>.apk`.
 
-Артефакты и релизы: вкладка **Actions** / **Releases** репозитория.
+No debug APK or debug pre-release is generated.
 
 ## Planned implementation
 
