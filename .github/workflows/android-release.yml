@@ -40,13 +40,16 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Configure release signing (optional)
-        if: ${{ secrets.TREXTRACK_KEYSTORE_BASE64 != '' }}
         env:
           KEYSTORE_BASE64: ${{ secrets.TREXTRACK_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.TREXTRACK_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.TREXTRACK_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.TREXTRACK_KEY_PASSWORD }}
         run: |
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "No release keystore configured; building an unsigned release APK."
+            exit 0
+          fi
           echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/trextrack-release.jks"
           {
             echo "ORG_GRADLE_PROJECT_TREXTRACK_STORE_FILE=$RUNNER_TEMP/trextrack-release.jks"
