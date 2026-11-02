@@ -138,6 +138,9 @@ class WatchDirectActivity : Activity() {
     /** Current lower-bound for the next summary request. Advanced after each workout. */
     private var currentSportsLowerBound: java.util.Calendar? = null
 
+    /** Pending sports fetch timeout; cancelled when a new request starts or data arrives. */
+    private var sportsTimeoutRunnable: Runnable? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -920,6 +923,7 @@ class WatchDirectActivity : Activity() {
         zeppAuthInProgress = false
         sessionAesKey = null
         // Fresh sports multi-fetch session
+        cancelSportsTimeout()
         sportsFetchedCount = 0
         currentSportsLowerBound = null
         lastParsedSummary = null
@@ -1560,6 +1564,23 @@ class WatchDirectActivity : Activity() {
         }, 5_000)
     }
 
+    private fun cancelSportsTimeout() {
+        sportsTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        sportsTimeoutRunnable = null
+    }
+
+    private fun scheduleSportsTimeout(what: String, delayMs: Long) {
+        cancelSportsTimeout()
+        val r = Runnable {
+            if (loadInProgress && !finishPosted) {
+                Log.w(TAG, "sports $what timeout (type=0x${"%02x".format(sportsFetchType)})")
+                finishSportsFetch("timeout-$what")
+            }
+        }
+        sportsTimeoutRunnable = r
+        handler.postDelayed(r, delayMs)
+    }
+
     /**
      * Request sports summaries (type 0x05) via the ACTIVITY_CONTROL /
      * ACTIVITY_DATA flow used by Gadgetbridge for Amazfit T-Rex 2.
@@ -1617,11 +1638,7 @@ class WatchDirectActivity : Activity() {
         }
         writeActivityControl(g, cmd)
 
-        handler.postDelayed({
-            if (loadInProgress && !finishPosted && sportsFetchType == 0x05.toByte()) {
-                finishSportsFetch("timeout-summaries")
-            }
-        }, 20_000)
+        scheduleSportsTimeout("summaries", 25_000)
     }
 
     /** Write activity/sports control either via 0x004b or classic characteristic. */
@@ -1657,6 +1674,7 @@ class WatchDirectActivity : Activity() {
     }
 
     private fun finishSportsFetch(reason: String) {
+        cancelSportsTimeout()
         sportsFetchActive = false
         val raw = sportsDataBuffer.toByteArray()
         val head = HuamiBleProtocol.hex(raw.copyOf(minOf(32, raw.size)))
@@ -1726,6 +1744,7 @@ class WatchDirectActivity : Activity() {
      */
     @SuppressLint("MissingPermission")
     private fun advanceLowerBoundAndContinue(g: BluetoothGatt) {
+        cancelSportsTimeout()
         sportsFetchedCount++
 
         val summary = lastParsedSummary
@@ -1793,6 +1812,7 @@ class WatchDirectActivity : Activity() {
     /** Fetch GPS/track details (type 0x06) for the last summary start time. */
     @SuppressLint("MissingPermission")
     private fun requestSportsDetails(g: BluetoothGatt) {
+        cancelSportsTimeout()
         activityBuffer.clear()
         activityBytesReceived = 0
         sportsDataBuffer.reset()
@@ -1830,11 +1850,8 @@ class WatchDirectActivity : Activity() {
         runOnUiThread { setStatus("Запрос GPS details…") }
         writeActivityControl(g, cmd)
 
-        handler.postDelayed({
-            if (loadInProgress && !finishPosted && sportsFetchType == 0x06.toByte()) {
-                finishSportsFetch("timeout-details")
-            }
-        }, 30_000)
+        // Large GPS tracks (500KB+) can take well over 30s on classic ATT
+        scheduleSportsTimeout("details", 90_000)
     }
 
     @SuppressLint("MissingPermission")
