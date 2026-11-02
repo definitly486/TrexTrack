@@ -139,6 +139,55 @@ class ZeppCloudRepositoryImpl(
         return GpxTrack(workoutId = workoutId, gpxXml = gpx)
     }
 
+
+    override suspend fun listBoundDevices(): List<BoundDevice> {
+        val token = sessionStore.getAppToken() ?: throw IllegalStateException("Нет активной сессии. Сначала войдите в облако Zepp.")
+        val userId = sessionStore.getUserId() ?: throw IllegalStateException("Нет user_id")
+
+        val path = "/users/" + userId + "/devices?enableMultiDevice=true"
+        val body = getJson(path, token)
+        val items = body.optJSONArray("items") ?: JSONArray()
+        val out = ArrayList<BoundDevice>()
+        for (i in 0 until items.length()) {
+            val o = items.optJSONObject(i) ?: continue
+            val mac = o.optString("macAddress").ifBlank { o.optString("mac") }
+            if (mac.isBlank()) continue
+            val additional = o.optString("additionalInfo")
+            var authKey = ""
+            if (additional.isNotBlank()) {
+                try {
+                    val info = JSONObject(additional)
+                    authKey = info.optString("auth_key")
+                        .ifBlank { info.optString("authKey") }
+                        .ifBlank { info.optString("btKey") }
+                } catch (_: JSONException) {
+                    // ignore
+                }
+            }
+            if (authKey.isBlank()) {
+                authKey = o.optString("auth_key").ifBlank { o.optString("btKey") }
+            }
+            authKey = authKey.trim().removePrefix("0x").removePrefix("0X")
+            val active = o.optInt("activeStatus", o.optInt("bindingStatus", 0)) == 1
+            val source = o.optInt("deviceSource", 0)
+            val fw = o.optString("firmwareVersion").ifBlank { "?" }
+            val label = "source=$source · fw=$fw"
+            if (authKey.isBlank()) {
+                Log.w(TAG, "device $mac has no auth_key in additionalInfo")
+            }
+            out.add(
+                BoundDevice(
+                    macAddress = mac.uppercase(),
+                    authKeyHex = authKey.lowercase(),
+                    active = active,
+                    label = label
+                )
+            )
+        }
+        Log.i(TAG, "listBoundDevices: " + out.size + " devices")
+        return out
+    }
+
     fun logout() {
         sessionStore.clear()
         sourceByTrackId.clear()
