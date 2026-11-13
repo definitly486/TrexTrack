@@ -1344,6 +1344,7 @@ class WatchDirectActivity : Activity() {
 
         batteryRequestPending = false
         runOnUiThread { lastChargeButton.isEnabled = true }
+        Log.i(TAG, "battery raw reply len=${payload.size} hex=${HuamiBleProtocol.hex(payload)}")
         val batteryLevel = payload[2].toInt() and 0xff
         val charging = (payload[3].toInt() and 0xff) == 1
         val year = (payload[11].toInt() and 0xff) or ((payload[12].toInt() and 0xff) shl 8)
