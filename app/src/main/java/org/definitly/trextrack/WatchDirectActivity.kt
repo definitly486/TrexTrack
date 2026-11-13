@@ -1223,13 +1223,6 @@ class WatchDirectActivity : Activity() {
         // ECDH/chunked transport remains in use for authentication and other services.
         // Do not route workout fetch through the unverified 0x004b endpoint.
         Log.i(TAG, "sports fetch transport=classic ACTIVITY_CONTROL/ACTIVITY_DATA")
-        if (supportedEndpoints.contains(batteryEndpoint)) {
-            requestLastChargeInfo(g)
-        } else {
-            runOnUiThread {
-                batteryInfoView.text = "Последняя зарядка: часы не объявили battery endpoint (0x0029)"
-            }
-        }
         runOnUiThread { setStatus("Сервисы: $num, sports via classic ACT_CTL…") }
         requestSportsSummaries(g)
     }
@@ -2123,9 +2116,20 @@ class WatchDirectActivity : Activity() {
             error = !authenticated
         )
         Log.i(TAG, "finishLoad auth=$authenticated note=$note packets=${activityBuffer.size}")
+
+        // Query battery only after the workout transfer is complete, so its
+        // CH2021 write cannot collide with the classic ACTIVITY_CONTROL exchange.
+        if (authenticated && authState == HuamiBleProtocol.AuthState.AUTHENTICATED &&
+            supportedEndpoints.contains(batteryEndpoint)) {
+            handler.postDelayed({
+                gatt?.let { requestLastChargeInfo(it) }
+            }, 500)
+        } else if (authenticated && !supportedEndpoints.contains(batteryEndpoint)) {
+            batteryInfoView.text = "Последняя зарядка: battery endpoint (0x0029) не поддерживается"
+        }
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun matchWrap() = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
