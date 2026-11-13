@@ -913,7 +913,7 @@ class WatchDirectActivity : Activity() {
             batteryInfoView.text = "Последняя зарядка: сначала подключите часы"
             return
         }
-        if (batteryRequestPending || zeppAuthInProgress) {
+        if (batteryOnlyMode || batteryRequestPending || zeppAuthInProgress) {
             setStatus("Запрос данных часов уже выполняется")
             return
         }
@@ -931,6 +931,7 @@ class WatchDirectActivity : Activity() {
         }
 
         batteryOnlyMode = true
+        lastChargeButton.isEnabled = false
         batteryRequestPending = false
         authKeyBytes = keyBytes
         authState = HuamiBleProtocol.AuthState.IDLE
@@ -1291,6 +1292,7 @@ class WatchDirectActivity : Activity() {
             } else {
                 batteryOnlyMode = false
                 runOnUiThread {
+                    lastChargeButton.isEnabled = true
                     batteryInfoView.text = "Последняя зарядка: часы не объявили battery endpoint (0x0029)"
                     setStatus("Battery endpoint не поддерживается", error = true)
                 }
@@ -1317,6 +1319,7 @@ class WatchDirectActivity : Activity() {
             if (batteryRequestPending && gatt === g) {
                 batteryRequestPending = false
                 runOnUiThread {
+                    lastChargeButton.isEnabled = true
                     batteryInfoView.text = "Последняя зарядка: часы не ответили на запрос"
                 }
                 Log.w(TAG, "battery endpoint request timed out")
@@ -1330,14 +1333,17 @@ class WatchDirectActivity : Activity() {
             return
         }
         if (payload.size < 21) {
+            batteryRequestPending = false
             Log.w(TAG, "battery reply too short: ${payload.size} bytes")
             runOnUiThread {
+                lastChargeButton.isEnabled = true
                 batteryInfoView.text = "Последняя зарядка: неполный ответ часов (${payload.size} байт)"
             }
             return
         }
 
         batteryRequestPending = false
+        runOnUiThread { lastChargeButton.isEnabled = true }
         val batteryLevel = payload[2].toInt() and 0xff
         val charging = (payload[3].toInt() and 0xff) == 1
         val year = (payload[11].toInt() and 0xff) or ((payload[12].toInt() and 0xff) shl 8)
@@ -2167,6 +2173,7 @@ class WatchDirectActivity : Activity() {
             batteryOnlyMode = false
             zeppAuthInProgress = false
             batteryRequestPending = false
+            runOnUiThread { lastChargeButton.isEnabled = true }
             batteryInfoView.text = "Последняя зарядка: ошибка аутентификации — $note"
             setStatus("Отдельный запрос последней зарядки не выполнен: $note", error = true)
             Log.w(TAG, "battery-only auth failed: $note")
