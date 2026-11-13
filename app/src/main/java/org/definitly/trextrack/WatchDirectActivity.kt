@@ -894,15 +894,6 @@ class WatchDirectActivity : Activity() {
     }
 
     /**
-     * Загрузка треков с часов:
-     * 1) проверка GATT + Huami-сервисов + auth key;
-     * 2) enable notifications (AUTH + ACTIVITY_DATA, при наличии — chunked/Zepp FT);
-     * 3) classic Huami AES-auth;
-     * 4) после auth — запрос activity data (список/сырые пакеты);
-     * 5) Zepp OS file-transfer / GPS points — структура готова, полный парсер — следующий этап.
-     */
-    @SuppressLint("MissingPermission")
-    /**
      * Battery-only flow: authenticate the watch and request endpoint 0x0029
      * without starting ACTIVITY_CONTROL / workout synchronization.
      */
@@ -953,6 +944,15 @@ class WatchDirectActivity : Activity() {
         enableNextNotification(g, toEnable, 0)
     }
 
+    /**
+     * Загрузка треков с часов:
+     * 1) проверка GATT + Huami-сервисов + auth key;
+     * 2) enable notifications (AUTH + ACTIVITY_DATA, при наличии — chunked/Zepp FT);
+     * 3) classic Huami AES-auth;
+     * 4) после auth — запрос activity data (список/сырые пакеты);
+     * 5) Zepp OS file-transfer / GPS points — структура готова, полный парсер — следующий этап.
+     */
+    @SuppressLint("MissingPermission")
     private fun loadTracksFromWatch() {
         val g = gatt
         if (!connected || g == null) {
