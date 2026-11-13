@@ -64,6 +64,7 @@ class WatchDirectActivity : Activity() {
     private lateinit var scanButton: Button
     private lateinit var connectButton: Button
     private lateinit var loadTracksButton: Button
+    private lateinit var lastChargeButton: Button
     private lateinit var disconnectButton: Button
     private lateinit var authKeyButton: Button
     private lateinit var exportAuthKeyButton: Button
@@ -116,6 +117,7 @@ class WatchDirectActivity : Activity() {
     private val supportedEndpoints = mutableSetOf<Short>()
     private val batteryEndpoint: Short = 0x0029.toShort()
     private var batteryRequestPending = false
+    private var batteryOnlyMode = false
     // Sports summary fetch through the classic ACTIVITY_CONTROL / ACTIVITY_DATA GATT characteristics
     private var sportsFetchActive = false
     private var expectedSportsBytes = -1
@@ -183,6 +185,13 @@ class WatchDirectActivity : Activity() {
             setBackgroundColor(0xFFF0F4F8.toInt())
         }
         content.addView(batteryInfoView, matchWrap())
+
+        lastChargeButton = Button(this).apply {
+            text = "Запросить последнюю зарядку"
+            isEnabled = false
+            setOnClickListener { requestLastChargeIndependently() }
+        }
+        content.addView(lastChargeButton, matchWrap())
 
         scanButton = Button(this).apply {
             text = "Сканировать BLE"
@@ -674,6 +683,7 @@ class WatchDirectActivity : Activity() {
                         setStatus("Подключено. Обнаружение сервисов…", ok = true)
                         disconnectButton.isEnabled = true
                         loadTracksButton.isEnabled = true
+                        lastChargeButton.isEnabled = true
                         try {
                             g.discoverServices()
                         } catch (e: Exception) {
@@ -687,6 +697,9 @@ class WatchDirectActivity : Activity() {
                         setStatus("Отключено", error = true)
                         disconnectButton.isEnabled = false
                         loadTracksButton.isEnabled = false
+                        lastChargeButton.isEnabled = false
+                        batteryRequestPending = false
+                        batteryOnlyMode = false
                         servicesView.text = "—"
                         connectButton.isEnabled = selectedDevice != null
                     }
@@ -840,6 +853,9 @@ class WatchDirectActivity : Activity() {
         activityBuffer.clear()
         activityBytesReceived = 0
         loadTracksButton.isEnabled = false
+        lastChargeButton.isEnabled = false
+        batteryRequestPending = false
+        batteryOnlyMode = false
         disconnectButton.isEnabled = false
         connectButton.isEnabled = selectedDevice != null
         servicesView.text = "—"
@@ -886,6 +902,56 @@ class WatchDirectActivity : Activity() {
      * 5) Zepp OS file-transfer / GPS points — структура готова, полный парсер — следующий этап.
      */
     @SuppressLint("MissingPermission")
+    /**
+     * Battery-only flow: authenticate the watch and request endpoint 0x0029
+     * without starting ACTIVITY_CONTROL / workout synchronization.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestLastChargeIndependently() {
+        val g = gatt
+        if (!connected || g == null) {
+            batteryInfoView.text = "Последняя зарядка: сначала подключите часы"
+            return
+        }
+        if (batteryRequestPending || zeppAuthInProgress) {
+            setStatus("Запрос данных часов уже выполняется")
+            return
+        }
+        val keyHex = authKeyHex ?: sessionStore.getAuthKey()
+        val keyBytes = HuamiBleProtocol.parseAuthKeyHex(keyHex)
+        if (keyBytes == null) {
+            batteryInfoView.text = "Последняя зарядка: сначала задайте Huami auth key"
+            setStatus("Для запроса последней зарядки нужен auth key", error = true)
+            return
+        }
+        if (!HuamiBleProtocol.hasZeppOsTransfer(g)) {
+            batteryInfoView.text = "Последняя зарядка: нет Zepp OS chunked transport"
+            setStatus("Часы не предоставляют CH2021 transport", error = true)
+            return
+        }
+
+        batteryOnlyMode = true
+        batteryRequestPending = false
+        authKeyBytes = keyBytes
+        authState = HuamiBleProtocol.AuthState.IDLE
+        zeppAuthInProgress = false
+        sessionAesKey = null
+        supportedEndpoints.clear()
+        batteryInfoView.text = "Последняя зарядка: выполняется отдельная аутентификация…"
+        setStatus("Подготовка отдельного запроса последней зарядки…")
+        Log.i(TAG, "battery-only request started; workout sync will not run")
+
+        val toEnable = mutableListOf<BluetoothGattCharacteristic>()
+        HuamiBleProtocol.findCharacteristic(g, HuamiBleProtocol.CHAR_CHUNKED_2021_READ)?.let { toEnable.add(it) }
+        if (toEnable.isEmpty()) {
+            batteryOnlyMode = false
+            batteryInfoView.text = "Последняя зарядка: нет CH2021 notification characteristic"
+            setStatus("Нет CH2021 READ characteristic", error = true)
+            return
+        }
+        enableNextNotification(g, toEnable, 0)
+    }
+
     private fun loadTracksFromWatch() {
         val g = gatt
         if (!connected || g == null) {
@@ -1218,10 +1284,20 @@ class WatchDirectActivity : Activity() {
             supportedEndpoints.add(ep)
             Log.d(TAG, "  service 0x${"%04x".format(ep.toInt())} enc=$encFlag")
         }
-        // Gadgetbridge's T-Rex 2 implementation fetches workout summaries/details
-        // through the legacy ACTIVITY_CONTROL and ACTIVITY_DATA GATT characteristics.
-        // ECDH/chunked transport remains in use for authentication and other services.
-        // Do not route workout fetch through the unverified 0x004b endpoint.
+        if (batteryOnlyMode) {
+            if (supportedEndpoints.contains(batteryEndpoint)) {
+                requestLastChargeInfo(g)
+            } else {
+                batteryOnlyMode = false
+                runOnUiThread {
+                    batteryInfoView.text = "Последняя зарядка: часы не объявили battery endpoint (0x0029)"
+                    setStatus("Battery endpoint не поддерживается", error = true)
+                }
+            }
+            return
+        }
+
+        // Workout synchronization remains on its existing ACTIVITY_CONTROL path.
         Log.i(TAG, "sports fetch transport=classic ACTIVITY_CONTROL/ACTIVITY_DATA")
         runOnUiThread { setStatus("Сервисы: $num, sports via classic ACT_CTL…") }
         requestSportsSummaries(g)
@@ -1633,7 +1709,11 @@ class WatchDirectActivity : Activity() {
         writeChunked(g, CHUNKED2021_ENDPOINT_SERVICES, byteArrayOf(0x03), encrypt = false)
         // Fallback: if no services reply, still try sports after delay
         handler.postDelayed({
-            if (loadInProgress && !finishPosted && supportedEndpoints.isEmpty()) {
+            if (batteryOnlyMode && gatt === g && supportedEndpoints.isEmpty()) {
+                batteryOnlyMode = false
+                batteryInfoView.text = "Последняя зарядка: часы не вернули список сервисов"
+                setStatus("Таймаут списка Zepp OS сервисов", error = true)
+            } else if (loadInProgress && !finishPosted && supportedEndpoints.isEmpty()) {
                 Log.w(TAG, "no services list reply, trying sports anyway")
                 requestSportsSummaries(g)
             }
@@ -1988,7 +2068,15 @@ class WatchDirectActivity : Activity() {
             HuamiBleProtocol.AuthParseResult.Success -> {
                 authState = HuamiBleProtocol.AuthState.AUTHENTICATED
                 runOnUiThread { setStatus("Auth: успех. Запрос activity…", ok = true) }
-                handler.post { requestActivityData(g) }
+                if (batteryOnlyMode) {
+                    batteryOnlyMode = false
+                    runOnUiThread {
+                        batteryInfoView.text = "Последняя зарядка: часы используют classic AUTH; отдельный battery endpoint недоступен"
+                        setStatus("Classic AUTH завершён, но Zepp battery endpoint недоступен", error = true)
+                    }
+                } else {
+                    handler.post { requestActivityData(g) }
+                }
             }
             HuamiBleProtocol.AuthParseResult.Fail -> {
                 authState = HuamiBleProtocol.AuthState.FAILED
@@ -2117,16 +2205,6 @@ class WatchDirectActivity : Activity() {
         )
         Log.i(TAG, "finishLoad auth=$authenticated note=$note packets=${activityBuffer.size}")
 
-        // Query battery only after the workout transfer is complete, so its
-        // CH2021 write cannot collide with the classic ACTIVITY_CONTROL exchange.
-        if (authenticated && authState == HuamiBleProtocol.AuthState.AUTHENTICATED &&
-            supportedEndpoints.contains(batteryEndpoint)) {
-            handler.postDelayed({
-                gatt?.let { requestLastChargeInfo(it) }
-            }, 500)
-        } else if (authenticated && !supportedEndpoints.contains(batteryEndpoint)) {
-            batteryInfoView.text = "Последняя зарядка: battery endpoint (0x0029) не поддерживается"
-        }
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
