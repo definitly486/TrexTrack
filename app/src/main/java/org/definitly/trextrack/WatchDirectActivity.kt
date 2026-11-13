@@ -1347,12 +1347,12 @@ class WatchDirectActivity : Activity() {
         Log.i(TAG, "battery raw reply len=${payload.size} hex=${HuamiBleProtocol.hex(payload)}")
         val batteryLevel = payload[2].toInt() and 0xff
         val charging = (payload[3].toInt() and 0xff) == 1
-        val year = (payload[11].toInt() and 0xff) or ((payload[12].toInt() and 0xff) shl 8)
-        val month = payload[13].toInt() and 0xff
-        val day = payload[14].toInt() and 0xff
-        val hour = payload[15].toInt() and 0xff
-        val minute = payload[16].toInt() and 0xff
-        val second = payload[17].toInt() and 0xff
+        val year = (payload[12].toInt() and 0xff) or ((payload[13].toInt() and 0xff) shl 8)
+        val month = payload[14].toInt() and 0xff
+        val day = payload[15].toInt() and 0xff
+        val hour = payload[16].toInt() and 0xff
+        val minute = payload[17].toInt() and 0xff
+        val second = payload[18].toInt() and 0xff
         val lastChargeLevel = payload[20].toInt() and 0xff
 
         val dateText = if (year in 2000..2100 && month in 1..12 && day in 1..31 &&
