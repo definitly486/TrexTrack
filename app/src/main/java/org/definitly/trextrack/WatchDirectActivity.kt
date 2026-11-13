@@ -58,6 +58,7 @@ import kotlinx.coroutines.withContext
 class WatchDirectActivity : Activity() {
 
     private lateinit var statusView: TextView
+    private lateinit var batteryInfoView: TextView
     private lateinit var deviceListView: TextView
     private lateinit var servicesView: TextView
     private lateinit var scanButton: Button
@@ -113,6 +114,8 @@ class WatchDirectActivity : Activity() {
     private var gattWriteInFlight = false
     private var negotiatedMtu: Int = 23
     private val supportedEndpoints = mutableSetOf<Short>()
+    private val batteryEndpoint: Short = 0x0029.toShort()
+    private var batteryRequestPending = false
     // Sports summary fetch through the classic ACTIVITY_CONTROL / ACTIVITY_DATA GATT characteristics
     private var sportsFetchActive = false
     private var expectedSportsBytes = -1
@@ -172,6 +175,14 @@ class WatchDirectActivity : Activity() {
             setTextColor(0xFF8A3B12.toInt())
         }
         content.addView(statusView, matchWrap())
+
+        batteryInfoView = TextView(this).apply {
+            text = "Последняя зарядка: ещё не запрашивалась"
+            textSize = 14f
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(0xFFF0F4F8.toInt())
+        }
+        content.addView(batteryInfoView, matchWrap())
 
         scanButton = Button(this).apply {
             text = "Сканировать BLE"
@@ -1155,6 +1166,7 @@ class WatchDirectActivity : Activity() {
             CHUNKED2021_ENDPOINT_ACTIVITY -> Log.d(TAG, "ignore chunked activity endpoint for workout fetch; T-Rex 2 uses ACTIVITY_CONTROL/ACTIVITY_DATA")
             CHUNKED2021_ENDPOINT_SERVICES -> handleServicesEndpoint(g, payload)
             CHUNKED2021_ENDPOINT_CONNECTION -> handleConnectionEndpoint(g, payload)
+            batteryEndpoint -> handleBatteryEndpoint(payload)
             else -> {
                 Log.d(TAG, "endpoint 0x${"%04x".format(type.toInt())} len=${payload.size} " +
                     HuamiBleProtocol.hex(payload.copyOf(minOf(24, payload.size))))
@@ -1211,8 +1223,79 @@ class WatchDirectActivity : Activity() {
         // ECDH/chunked transport remains in use for authentication and other services.
         // Do not route workout fetch through the unverified 0x004b endpoint.
         Log.i(TAG, "sports fetch transport=classic ACTIVITY_CONTROL/ACTIVITY_DATA")
+        if (supportedEndpoints.contains(batteryEndpoint)) {
+            requestLastChargeInfo(g)
+        } else {
+            runOnUiThread {
+                batteryInfoView.text = "Последняя зарядка: часы не объявили battery endpoint (0x0029)"
+            }
+        }
         runOnUiThread { setStatus("Сервисы: $num, sports via classic ACT_CTL…") }
         requestSportsSummaries(g)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestLastChargeInfo(g: BluetoothGatt) {
+        if (gatt !== g || !connected) return
+        batteryRequestPending = true
+        runOnUiThread { batteryInfoView.text = "Последняя зарядка: запрашиваю данные с часов…" }
+        Log.i(TAG, "request last charge info via Zepp OS battery endpoint 0x0029")
+        // Gadgetbridge protocol: endpoint 0x0029, BATTERY_REQUEST = 0x03.
+        // The request and reply are not encrypted.
+        writeChunked(g, batteryEndpoint, byteArrayOf(0x03), encrypt = false)
+        handler.postDelayed({
+            if (batteryRequestPending && gatt === g) {
+                batteryRequestPending = false
+                runOnUiThread {
+                    batteryInfoView.text = "Последняя зарядка: часы не ответили на запрос"
+                }
+                Log.w(TAG, "battery endpoint request timed out")
+            }
+        }, 8_000)
+    }
+
+    private fun handleBatteryEndpoint(payload: ByteArray) {
+        if (payload.isEmpty() || payload[0] != 0x04.toByte()) {
+            Log.w(TAG, "unexpected battery reply: ${HuamiBleProtocol.hex(payload)}")
+            return
+        }
+        if (payload.size < 21) {
+            Log.w(TAG, "battery reply too short: ${payload.size} bytes")
+            runOnUiThread {
+                batteryInfoView.text = "Последняя зарядка: неполный ответ часов (${payload.size} байт)"
+            }
+            return
+        }
+
+        batteryRequestPending = false
+        val batteryLevel = payload[2].toInt() and 0xff
+        val charging = (payload[3].toInt() and 0xff) == 1
+        val year = (payload[11].toInt() and 0xff) or ((payload[12].toInt() and 0xff) shl 8)
+        val month = payload[13].toInt() and 0xff
+        val day = payload[14].toInt() and 0xff
+        val hour = payload[15].toInt() and 0xff
+        val minute = payload[16].toInt() and 0xff
+        val second = payload[17].toInt() and 0xff
+        val lastChargeLevel = payload[20].toInt() and 0xff
+
+        val dateText = if (year in 2000..2100 && month in 1..12 && day in 1..31 &&
+            hour in 0..23 && minute in 0..59 && second in 0..59) {
+            "%02d.%02d.%04d %02d:%02d:%02d".format(
+                java.util.Locale.getDefault(), day, month, year, hour, minute, second
+            )
+        } else {
+            "дата не указана часами"
+        }
+        val stateText = if (charging) "заряжаются" else "не заряжаются"
+        val result = "Последняя зарядка: $dateText\n" +
+            "Заряд при последней зарядке: $lastChargeLevel%\n" +
+            "Текущий заряд: $batteryLevel% ($stateText)"
+        Log.i(
+            TAG,
+            "battery reply level=$batteryLevel charging=$charging lastCharge=" +
+                "$year-$month-$day $hour:$minute:$second lastChargeLevel=$lastChargeLevel"
+        )
+        runOnUiThread { batteryInfoView.text = result }
     }
 
     @SuppressLint("MissingPermission")
