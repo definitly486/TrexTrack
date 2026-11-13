@@ -1286,6 +1286,7 @@ class WatchDirectActivity : Activity() {
         }
         if (batteryOnlyMode) {
             if (supportedEndpoints.contains(batteryEndpoint)) {
+                batteryOnlyMode = false
                 requestLastChargeInfo(g)
             } else {
                 batteryOnlyMode = false
@@ -2162,6 +2163,15 @@ class WatchDirectActivity : Activity() {
     }
 
     private fun finishLoadWithSummary(authenticated: Boolean, note: String) {
+        if (batteryOnlyMode && !authenticated) {
+            batteryOnlyMode = false
+            zeppAuthInProgress = false
+            batteryRequestPending = false
+            batteryInfoView.text = "Последняя зарядка: ошибка аутентификации — $note"
+            setStatus("Отдельный запрос последней зарядки не выполнен: $note", error = true)
+            Log.w(TAG, "battery-only auth failed: $note")
+            return
+        }
         if (finishPosted) {
             Log.d(TAG, "finishLoad already shown, skip: $note")
             return
